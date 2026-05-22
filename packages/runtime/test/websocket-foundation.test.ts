@@ -67,6 +67,69 @@ describe('WebSocket transport foundation', () => {
 		expect(await response.json()).toMatchObject({ error: { type: 'workflow_not_http' } });
 	});
 
+	it('rejects concurrent attached prompts to the same agent session', async () => {
+		let release: (() => void) | undefined;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const base = {
+			owner: { kind: 'agent' as const, agentName: 'assistant', instanceId: 'user-1' },
+			id: 'user-1',
+			payload: { message: 'hello', session: 'chat' },
+			request: new Request('http://localhost/agents/assistant/user-1', { method: 'POST' }),
+			createContext,
+		};
+		const first = invokeAttached({
+			...base,
+			runId: 'run_first',
+			handler: async () => {
+				await pending;
+				return null;
+			},
+		});
+		await expect(invokeAttached({
+			...base,
+			runId: 'run_second',
+			handler: async () => null,
+		})).rejects.toMatchObject({ details: 'This agent session already has an active prompt.' });
+		release?.();
+		await first;
+	});
+
+	it('rejects HTTP webhook prompts while the same agent session is active', async () => {
+		let release: (() => void) | undefined;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		configureFlueRuntime({
+			target: 'node',
+			manifest: { agents: [{ name: 'assistant', channels: { http: true }, receive: false, created: true }] },
+			handlers: {
+				assistant: async () => {
+					await pending;
+					return null;
+				},
+			},
+			createContext,
+		});
+		const app = new Hono();
+		app.route('/', flue());
+		const first = await app.fetch(new Request('http://localhost/agents/assistant/user-1', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'x-webhook': 'true' },
+			body: JSON.stringify({ message: 'first', session: 'chat' }),
+		}));
+		expect(first.status).toBe(202);
+		const second = await app.fetch(new Request('http://localhost/agents/assistant/user-1', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ message: 'second', session: 'chat' }),
+		}));
+		expect(second.status).toBe(400);
+		expect(await second.json()).toMatchObject({ error: { type: 'invalid_request', details: 'This agent session already has an active prompt.' } });
+		release?.();
+	});
+
 	it('invokes attached work with an event sink independent of HTTP response formatting', async () => {
 		const events: FlueEvent[] = [];
 		const runStore = new InMemoryRunStore();

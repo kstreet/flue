@@ -384,6 +384,8 @@ export interface AttachedInvocationResult {
 	result: unknown;
 }
 
+const activeAttachedAgentSessions = new Set<string>();
+
 interface WebhookOptions {
 	label: string;
 	owner: RunOwner;
@@ -415,30 +417,42 @@ async function runWebhookMode(opts: WebhookOptions): Promise<Response> {
 		runRegistry,
 	} = opts;
 
+	const releaseSessionLock = acquireAgentSessionLock(opts);
 	// Webhook mode relies on `startWebhook` for target-specific execution
 	// context (`runFiber` on Cloudflare), so it does not also use `runHandler`.
-	const lifecycle = await createRunLifecycle({
-		owner,
-		id,
-		runId,
-		payload,
-		request,
-		createContext,
-		runStore,
-		runSubscribers,
-		runRegistry,
-	});
+	let lifecycle: RunLifecycle;
+	try {
+		lifecycle = await createRunLifecycle({
+			owner,
+			id,
+			runId,
+			payload,
+			request,
+			createContext,
+			runStore,
+			runSubscribers,
+			runRegistry,
+		});
+	} catch (error) {
+		releaseSessionLock?.();
+		throw error;
+	}
 	const { ctx } = lifecycle;
 	let didRun = false;
 	const run = async (): Promise<unknown> => {
 		didRun = true;
-		return withRunLifecycle(lifecycle, () => handler(ctx));
+		try {
+			return await withRunLifecycle(lifecycle, () => handler(ctx));
+		} finally {
+			releaseSessionLock?.();
+		}
 	};
 
 	try {
 		const scheduled = startWebhook(runId, run);
 		scheduled.then(
 			(result) => {
+				if (!didRun) releaseSessionLock?.();
 				console.log(
 					'[flue] Webhook handler complete:',
 					label,
@@ -447,10 +461,14 @@ async function runWebhookMode(opts: WebhookOptions): Promise<Response> {
 			},
 			async (err) => {
 				console.error('[flue] Webhook handler error:', label, err);
-				if (!didRun) await emitRunEnd(lifecycle, { isError: true, error: err });
+				if (!didRun) {
+					releaseSessionLock?.();
+					await emitRunEnd(lifecycle, { isError: true, error: err });
+				}
 			},
 		);
 	} catch (error) {
+		releaseSessionLock?.();
 		await emitRunEnd(lifecycle, { isError: true, error });
 		throw error;
 	}
@@ -540,6 +558,15 @@ async function runSyncMode(opts: ModeOptions): Promise<Response> {
 }
 
 export async function invokeAttached(opts: InvokeAttachedOptions): Promise<AttachedInvocationResult> {
+	const sessionLock = acquireAgentSessionLock(opts);
+	try {
+		return await invokeAttachedUnlocked(opts);
+	} finally {
+		sessionLock?.();
+	}
+}
+
+async function invokeAttachedUnlocked(opts: InvokeAttachedOptions): Promise<AttachedInvocationResult> {
 	const lifecycle = await createRunLifecycle({
 		owner: opts.owner,
 		id: opts.id,
@@ -572,6 +599,18 @@ export async function invokeAttached(opts: InvokeAttachedOptions): Promise<Attac
 	} finally {
 		ctx.setEventCallback(undefined);
 	}
+}
+
+function acquireAgentSessionLock(opts: InvokeAttachedOptions): (() => void) | undefined {
+	if (opts.owner.kind !== 'agent') return undefined;
+	const payload = opts.payload as { session?: unknown } | null;
+	const session = typeof payload?.session === 'string' && payload.session.trim() !== '' ? payload.session : 'default';
+	const key = `${opts.owner.agentName}\0${opts.owner.instanceId}\0${session}`;
+	if (activeAttachedAgentSessions.has(key)) {
+		throw new InvalidRequestError({ reason: 'This agent session already has an active prompt.' });
+	}
+	activeAttachedAgentSessions.add(key);
+	return () => activeAttachedAgentSessions.delete(key);
 }
 
 // ─── Run lifecycle ──────────────────────────────────────────────────────────

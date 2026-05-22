@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { build } from '../../cli/src/lib/build.ts';
 import { NodePlugin } from '../../cli/src/lib/build-plugin-node.ts';
 import type { BuildContext, BuildPlugin } from '../../cli/src/lib/types.ts';
+import type { WebSocketServerMessage } from '../src/types.ts';
 
 describe('Node build plugin', () => {
 	it('derives route metadata from imported agent and workflow modules', () => {
@@ -15,6 +16,8 @@ describe('Node build plugin', () => {
 		expect(entry).toContain("import * as handler_triage_0 from '/tmp/triage.ts'");
 		expect(entry).toContain("import * as workflow_daily_report_0 from '/tmp/daily-report.ts'");
 		expect(entry).toContain('const workflowHandlers = {};');
+		expect(entry).toContain('const websocketAgentHandlers = {};');
+		expect(entry).toContain('const websocketWorkflowHandlers = {};');
 		expect(entry).toContain('const normalized = normalizeBuiltModules(agentModules, workflowModules);');
 		expect(entry).not.toContain('channelModules');
 	});
@@ -50,6 +53,94 @@ describe('Node build plugin', () => {
 		} finally {
 			child.kill('SIGTERM');
 		}
+	});
+
+	it('invokes a WebSocket-only workflow without exposing HTTP POST', async () => {
+		const root = createFixtureRoot('flue-websocket-workflow-');
+		fs.mkdirSync(path.join(root, 'workflows'));
+		fs.writeFileSync(
+			path.join(root, 'workflows', 'socket-job.ts'),
+			`import { websocket } from '@flue/runtime';\n` +
+				`export const channels = [websocket()];\n` +
+				`export async function run(ctx) { ctx.log.info('socket run'); return { echoed: ctx.payload }; }\n`,
+		);
+		await build({ root, target: 'node' });
+
+		const { child, port } = await startGeneratedServer(root);
+		try {
+			const http = await fetch(`http://localhost:${port}/workflows/socket-job`, { method: 'POST' });
+			expect(http.status).toBe(404);
+			const socket = new WebSocket(`ws://localhost:${port}/workflows/socket-job`);
+			const messages = collectMessages(socket);
+			await waitForOpen(socket);
+			socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'req-1', payload: { ok: true } }));
+			const result = await waitForMessage(messages, (message) => message.type === 'result');
+			expect(result).toMatchObject({ type: 'result', requestId: 'req-1', result: { echoed: { ok: true } } });
+			expect(messages.some((message) => message.type === 'ready')).toBe(true);
+			expect(messages.some((message) => message.type === 'started')).toBe(true);
+			expect(messages.some((message) => message.type === 'event' && message.event.type === 'run_start')).toBe(true);
+			await waitForClose(socket);
+		} finally {
+			child.kill('SIGTERM');
+		}
+	});
+
+	it('rejects WebSocket upgrades for HTTP-only workflows', async () => {
+		const root = createFixtureRoot('flue-http-only-workflow-');
+		fs.mkdirSync(path.join(root, 'workflows'));
+		fs.writeFileSync(
+			path.join(root, 'workflows', 'http-job.ts'),
+			`import { http } from '@flue/runtime';\n` +
+				`export const channels = [http()];\n` +
+				`export async function run() { return { ok: true }; }\n`,
+		);
+		await build({ root, target: 'node' });
+
+		const { child, port } = await startGeneratedServer(root);
+		try {
+			const socket = new WebSocket(`ws://localhost:${port}/workflows/http-job`);
+			const failure = await waitForSocketFailure(socket);
+			expect(failure).toBe(true);
+		} finally {
+			child.kill('SIGTERM');
+		}
+	});
+
+	it('accepts agent WebSocket connections and ping frames independently of HTTP', async () => {
+		const root = createFixtureRoot('flue-websocket-agent-');
+		fs.mkdirSync(path.join(root, 'agents'));
+		fs.writeFileSync(
+			path.join(root, 'agents', 'assistant.ts'),
+			`import { createAgent, websocket } from '@flue/runtime';\n` +
+				`export const channels = [websocket()];\n` +
+				`export default createAgent(() => ({ model: false }));\n`,
+		);
+		await build({ root, target: 'node' });
+
+		const { child, port } = await startGeneratedServer(root);
+		try {
+			const http = await fetch(`http://localhost:${port}/agents/assistant/instance-1`, { method: 'POST' });
+			expect(http.status).toBe(404);
+			const socket = new WebSocket(`ws://localhost:${port}/agents/assistant/instance-1`);
+			const messages = collectMessages(socket);
+			await waitForOpen(socket);
+			const ready = await waitForMessage(messages, (message) => message.type === 'ready');
+			expect(ready).toMatchObject({ type: 'ready', target: 'agent', name: 'assistant', instanceId: 'instance-1' });
+			socket.send(JSON.stringify({ version: 1, type: 'ping', requestId: 'ping-1' }));
+			const pong = await waitForMessage(messages, (message) => message.type === 'pong');
+			expect(pong).toMatchObject({ type: 'pong', requestId: 'ping-1' });
+			socket.close();
+		} finally {
+			child.kill('SIGTERM');
+		}
+	});
+
+	it('does not auto-mount raw WebSocket upgrades when app.ts owns the request pipeline', () => {
+		const entry = new NodePlugin().generateEntryPoint({ ...testBuildContext(), appEntry: '/tmp/app.ts' });
+
+		expect(entry).not.toContain("import { createNodeWebSocketTransport } from '@flue/runtime/node';");
+		expect(entry).not.toContain('websocketTransport.attach(server);');
+		expect(entry).toContain('Custom app.ts WebSocket mounting is not yet supported.');
 	});
 
 	it('rejects duplicate agent basenames', async () => {
@@ -111,6 +202,64 @@ const parserOnlyPlugin: BuildPlugin = {
 		return 'export default {};\n';
 	},
 };
+
+function createFixtureRoot(prefix: string): string {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+	fs.mkdirSync(path.join(root, 'node_modules', '@flue'), { recursive: true });
+	fs.symlinkSync(process.cwd(), path.join(root, 'node_modules', '@flue', 'runtime'), 'dir');
+	return root;
+}
+
+async function startGeneratedServer(root: string): Promise<{ child: ChildProcess; port: number }> {
+	const port = await findAvailablePort();
+	const child = spawn('node', [path.join(root, 'dist', 'server.mjs')], {
+		cwd: root,
+		stdio: ['ignore', 'pipe', 'pipe'],
+		env: { ...process.env, PORT: String(port), FLUE_MODE: 'local' },
+	});
+	await waitForServer(child, port);
+	return { child, port };
+}
+
+function collectMessages(socket: WebSocket): WebSocketServerMessage[] {
+	const messages: WebSocketServerMessage[] = [];
+	socket.addEventListener('message', (event) => {
+		messages.push(JSON.parse(String(event.data)) as WebSocketServerMessage);
+	});
+	return messages;
+}
+
+async function waitForOpen(socket: WebSocket): Promise<void> {
+	if (socket.readyState === WebSocket.OPEN) return;
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener('open', () => resolve(), { once: true });
+		socket.addEventListener('error', () => reject(new Error('WebSocket failed before opening.')), { once: true });
+	});
+}
+
+async function waitForClose(socket: WebSocket): Promise<void> {
+	if (socket.readyState === WebSocket.CLOSED) return;
+	await new Promise<void>((resolve) => socket.addEventListener('close', () => resolve(), { once: true }));
+}
+
+async function waitForSocketFailure(socket: WebSocket): Promise<boolean> {
+	return new Promise((resolve) => {
+		socket.addEventListener('open', () => resolve(false), { once: true });
+		socket.addEventListener('error', () => resolve(true), { once: true });
+	});
+}
+
+async function waitForMessage(
+	messages: WebSocketServerMessage[],
+	predicate: (message: WebSocketServerMessage) => boolean,
+): Promise<WebSocketServerMessage> {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const found = messages.find(predicate);
+		if (found) return found;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Expected WebSocket message not received: ${JSON.stringify(messages)}`);
+}
 
 async function findAvailablePort(): Promise<number> {
 	return new Promise((resolve, reject) => {

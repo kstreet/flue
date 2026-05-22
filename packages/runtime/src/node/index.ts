@@ -6,3 +6,8 @@
  * `@flue/runtime`.
  */
 export { local, type LocalSandboxOptions } from './local.ts';
+export {
+	createNodeWebSocketTransport,
+	type NodeWebSocketTransport,
+	type NodeWebSocketTransportOptions,
+} from './websocket.ts';
