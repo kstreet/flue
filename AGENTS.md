@@ -132,3 +132,5 @@ A repo is built and deployed as an agent. `flue build` compiles the root (skills
 When using `task` to delegate to subagents, you MUST include a notice to the subagent to not spawn their own subagents. Otherwise we end up with inifinite spawning subagent chains.
 
 When accepting "review" task feedback, take durability and reliability bugs and improvement suggestions seriously, but be cautious of getting stuck in design churn hell. Reviews will almost always return *something*, so it's up to you as the main agent to understand when enough is enough, and to have a high bar for review feedback to be actionable.
+
+When writing new plans to disk, write them to `plans/` directory (gitignored, intentionally) with a YYYY-MM-DD filename prefix.

@@ -117,7 +117,7 @@ describe('bundled skill activation prompt', () => {
 		const nextOffset = Number(/Use offset=(\d+) to continue/.exec(largeFirstText)?.[1]);
 		const largeSecond = await read.execute('tool', { path: '/.flue/packaged-skills/skill%3Areview%3Afixture/assets/large.bin', offset: nextOffset });
 		const largeSecondText = largeSecond.content[0]?.type === 'text' ? largeSecond.content[0].text : '';
-		const decodedLarge = Buffer.from(`${largeFirstText}\n${largeSecondText}`.replace(/\n\n\[Showing[^]*?continue\.\]/g, '').replace(/\n/g, ''), 'base64');
+		const decodedLarge = Buffer.from(`${largeFirstText}\n${largeSecondText}`.replace(/\n\n\[Showing[\s\S]*?continue\.\]/g, '').replace(/\n/g, ''), 'base64');
 		expect(result.content[0]).toMatchObject({ text: 'License terms.' });
 		expect(binary.content[0]).toMatchObject({ text: '/wCA' });
 		expect(nextOffset).toBeGreaterThan(1);

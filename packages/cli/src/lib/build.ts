@@ -1,3 +1,4 @@
+import { cloudflare } from '@cloudflare/vite-plugin';
 import * as esbuild from 'esbuild';
 import * as fs from 'node:fs';
 import { builtinModules, createRequire } from 'node:module';
@@ -6,6 +7,7 @@ import { packageUpSync } from 'package-up';
 import { CloudflarePlugin } from './build-plugin-cloudflare.ts';
 import { NodePlugin } from './build-plugin-node.ts';
 import { bundleSkillImports } from './skill-bundle.ts';
+import { skillReferencePlugin } from './vite-skill-reference-plugin.ts';
 import type {
 	AgentInfo,
 	BuildContext,
@@ -171,15 +173,12 @@ export async function build(options: BuildOptions): Promise<BuildResult> {
 				? plugin.esbuildOptions(ctx)
 				: {};
 			const userExternals = getUserExternals(root);
-			const [{ build: viteBuild }, { viteSkillReferencePlugin }] = await Promise.all([
-				import('vite'),
-				import('./vite-skill-reference-plugin.ts'),
-			]);
+			const { build: viteBuild } = await import('vite');
+			const sharedViteConfig = createSharedViteConfig(root, [entryPath]);
 			await viteBuild({
-				configFile: false,
-				root,
+				...sharedViteConfig,
 				logLevel: 'warn',
-				plugins: [viteGeneratedEntryDependencyResolver(root), viteSkillReferencePlugin()],
+				plugins: [...sharedViteConfig.plugins, viteGeneratedEntryDependencyResolver(root)],
 				build: {
 					ssr: entryPath,
 					outDir: output,
@@ -425,10 +424,26 @@ function getUserExternals(root: string): string[] {
 	}
 }
 
-export function viteGeneratedEntryDependencyResolver(root: string) {
+function createSharedViteConfig(root: string, bootstrapEntries: readonly string[] = []) {
+	return {
+		configFile: false as const,
+		root,
+		plugins: [skillReferencePlugin({ root, bootstrapEntries })],
+	};
+}
+
+export function createCloudflareViteConfig(root: string, configPath: string, bootstrapEntries: readonly string[] = []) {
+	const sharedConfig = createSharedViteConfig(root, bootstrapEntries);
+	return {
+		...sharedConfig,
+		plugins: [...sharedConfig.plugins, ...cloudflare({ configPath, persistState: false, inspectorPort: false })],
+	};
+}
+
+function viteGeneratedEntryDependencyResolver(root: string) {
 	const resolvers = [...collectNodePaths(root)].map((nodePath) => createRequire(path.join(nodePath, '__flue_vite_resolve__.cjs')));
 	return {
-		name: 'flue-node-dependency-resolver',
+		name: 'flue-generated-entry-dependency-resolver',
 		enforce: 'pre' as const,
 		resolveId(source: string) {
 			if (source.startsWith('.') || source.startsWith('/') || source.startsWith('\0') || source.startsWith('virtual:') || source.startsWith('node:')) return null;
@@ -436,7 +451,6 @@ export function viteGeneratedEntryDependencyResolver(root: string) {
 				try {
 					return resolve.resolve(source);
 				} catch {
-					continue;
 				}
 			}
 			return null;

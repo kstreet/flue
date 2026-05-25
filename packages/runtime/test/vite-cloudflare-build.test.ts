@@ -1,12 +1,10 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { cloudflare } from '@cloudflare/vite-plugin';
 import { createBuilder, createServer } from 'vite';
 import { describe, expect, it } from 'vitest';
 import { ViteCloudflarePlugin } from '../../cli/src/lib/build-plugin-cloudflare.ts';
-import { build } from '../../cli/src/lib/build.ts';
-import { viteSkillReferencePlugin } from '../../cli/src/lib/vite-skill-reference-plugin.ts';
+import { build, createCloudflareViteConfig } from '../../cli/src/lib/build.ts';
 
 describe('Cloudflare Vite generated Worker prototype', () => {
 	it('builds a generated Worker entry with Durable Objects and imported skills through the official plugin', async () => {
@@ -16,11 +14,10 @@ describe('Cloudflare Vite generated Worker prototype', () => {
 		expect(config.main).toBe('_entry.ts');
 		expect(config.durable_objects?.bindings?.map((binding) => binding.class_name)).toEqual(expect.arrayContaining(['Assistant', 'SmokeWorkflow', 'FlueRegistry']));
 
+		const viteConfig = createCloudflareViteConfig(root, generatedConfig, [path.join(output, '_entry.ts')]);
 		const builder = await createBuilder({
-			configFile: false,
-			root,
+			...viteConfig,
 			logLevel: 'silent',
-			plugins: [viteSkillReferencePlugin(), ...cloudflare({ configPath: generatedConfig, persistState: false, inspectorPort: false })],
 			build: { outDir: path.join(root, 'vite-dist'), emptyOutDir: true },
 		});
 		await builder.buildApp();
@@ -29,11 +26,10 @@ describe('Cloudflare Vite generated Worker prototype', () => {
 
 	it('serves a deterministic generated workflow through workerd in Vite development', async () => {
 		const { root, output } = await createGeneratedFixture();
+		const viteConfig = createCloudflareViteConfig(root, path.join(output, 'wrangler.jsonc'), [path.join(output, '_entry.ts')]);
 		const server = await createServer({
-			configFile: false,
-			root,
+			...viteConfig,
 			logLevel: 'silent',
-			plugins: [viteSkillReferencePlugin(), ...cloudflare({ configPath: path.join(output, 'wrangler.jsonc'), persistState: false, inspectorPort: false })],
 			server: { host: '127.0.0.1', port: 0 },
 		});
 		try {
