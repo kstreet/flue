@@ -8,6 +8,8 @@
 
 ### Breaking Changes
 
+- **Cloudflare Shell sandbox wiring is now project-owned.** Install it with `flue add @cloudflare/shell` and import `getShellSandbox`, `getDefaultWorkspace`, and `hydrateFromBucket` from the generated connector file; `@flue/runtime/cloudflare` no longer bundles the `@cloudflare/shell` implementation.
+
 - **Public HTTP and WebSocket exposure is now declared exclusively through middleware exports.** Agent and workflow modules export `route` to enable HTTP access and `websocket` to enable WebSocket access; the middleware may authorize or transform requests and call `await next()` to enter Flue's built-in handler. The former attached `channels = [http()]` / `channels = [websocket()]` declarations are no longer supported. Authored provider channel applications created with `defineChannel(...)` are unchanged.
 
 ### Fixes & Other Changes

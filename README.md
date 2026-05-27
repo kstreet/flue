@@ -65,45 +65,36 @@ export async function run({ init, payload }: FlueContext) {
 
 ### Support Agent
 
-A support agent can also run on Cloudflare without a container by using a cf-shell Workspace. The Workspace is a durable SQLite-indexed filesystem; R2 is an optional hydration source (and large-file spillover), not a live bucket mount. Copy the R2 objects you want into the Workspace before calling `init()`, then the agent operates on that structured filesystem through the `code` tool and `state.*` API.
+A support agent can also run on Cloudflare without a container by using Flue's default virtual sandbox. Populate its filesystem with the context the agent needs, then it can search that content with its built-in `grep`, `glob`, and `read` tools.
 
 Because this agent is deployed to Cloudflare, message history and session state are automatically persisted for you. So you (or your customer) can revisit this support session days, weeks, or years later and pick up exactly where you left off.
 
 ```ts
 // .flue/workflows/support.ts
 import { createAgent, type FlueContext, type WorkflowRouteHandler } from '@flue/runtime';
-import { getDefaultWorkspace, getShellSandbox, hydrateFromBucket } from '@flue/runtime/cloudflare';
-import * as v from 'valibot';
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();
 
-export async function run({ init, payload, env }: FlueContext) {
-  const workspace = getDefaultWorkspace();
+const support = createAgent(() => ({ model: 'openrouter/moonshotai/kimi-k2.6' }));
 
-  // Hydrate once per agent instance. R2 is a source, not a live mount.
-  if (!(await workspace.exists('/.hydrated'))) {
-    await hydrateFromBucket(workspace, env.KNOWLEDGE_BASE);
-    await workspace.writeFile('/.hydrated', new Date().toISOString());
-  }
-
-  const agent = createAgent(() => ({
-    sandbox: getShellSandbox({ workspace, loader: env.LOADER }),
-    model: 'openrouter/moonshotai/kimi-k2.6',
-  }));
-  const harness = await init(agent);
+export async function run({ init, payload }: FlueContext) {
+  const harness = await init(support);
   const session = await harness.session();
 
-  return await session.prompt(
-    `You are a support agent. Use the code tool to search the hydrated
-    workspace for articles relevant to this request, then write a helpful response.
+  await session.fs.mkdir('/workspace/articles', { recursive: true });
+  await session.fs.writeFile(
+    '/workspace/articles/reset-password.md',
+    '# Reset your password\n\nUse the account settings page to request a password reset email.',
+  );
 
-    Customer: ${payload.message}`,
-    {},
+  return await session.prompt(
+    `You are a support agent. Search the workspace for articles relevant
+    to this request, then write a helpful response.\n\nCustomer: ${payload.message}`,
   );
 }
 ```
 
-This requires a `worker_loaders` binding (`{ "worker_loaders": [{ "binding": "LOADER" }] }`) in your `wrangler.jsonc`. If you need true bucket-keys-as-filesystem-paths semantics or Linux shell commands, use `@cloudflare/sandbox` Containers with `mountBucket` instead. See [Cloudflare Shell Sandbox](https://github.com/withastro/flue/blob/main/docs/cloudflare-shell.md) for the full migration and trade-offs.
+This uses Flue's built-in, just-bash-powered virtual sandbox; no connector or container is required.
 
 ### Issue Triage (CI)
 

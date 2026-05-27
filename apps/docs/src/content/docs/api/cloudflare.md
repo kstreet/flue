@@ -7,9 +7,9 @@ description: Reference Cloudflare-specific sandboxes, Workers AI, storage, and r
 
 TODO: Document Cloudflare-specific imports and deployment context.
 
-## Workspaces and sandboxes
+## Sandboxes
 
-TODO: Reference `getShellSandbox(...)`, `getDefaultWorkspace()`, `hydrateFromBucket(...)`, and `cfSandboxToSessionEnv(...)`.
+TODO: Reference `cfSandboxToSessionEnv(...)` and Cloudflare Container Sandbox integration.
 
 ## Workers AI
 

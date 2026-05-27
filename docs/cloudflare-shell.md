@@ -1,8 +1,8 @@
 # Cloudflare Shell Sandbox
 
-Flue's Cloudflare shell sandbox is built on [`@cloudflare/shell`](https://www.npmjs.com/package/@cloudflare/shell): a durable, SQLite-indexed `Workspace` plus a codemode `code` tool that runs JavaScript in an isolated Worker through a `worker_loaders` binding.
+Flue's Cloudflare shell sandbox connector is built on [`@cloudflare/shell`](https://www.npmjs.com/package/@cloudflare/shell): a durable, SQLite-indexed `Workspace` plus a codemode `code` tool that runs JavaScript in an isolated Worker through a `worker_loaders` binding.
 
-The common R2 hydration flow only imports Flue helpers. Install `@cloudflare/shell` directly when you want to construct custom Workspaces or use git helpers like `WorkspaceFileSystem` and `createGit`.
+Install the connector with `flue add @cloudflare/shell`. The generated connector file includes `hydrateFromBucket()` for the common R2 hydration flow. Install `@cloudflare/shell` directly when you want to construct custom Workspaces or use git helpers like `WorkspaceFileSystem` and `createGit`.
 
 This replaces the old `getVirtualSandbox(env.BUCKET)` API. That API described R2 as if it were mounted directly as the agent filesystem. That was not accurate: `Workspace` stores directory/file metadata in Durable Object SQLite and only uses R2 as blob spillover for large files written through the Workspace API. Raw R2 keys uploaded with `wrangler r2 object put` are not visible until you explicitly hydrate them into the Workspace.
 
@@ -14,7 +14,7 @@ import {
   getDefaultWorkspace,
   getShellSandbox,
   hydrateFromBucket,
-} from '@flue/runtime/cloudflare';
+} from '../connectors/cloudflare-shell';
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();
 
@@ -127,7 +127,7 @@ For git, install `@cloudflare/shell` and use its primitives directly:
 ```ts
 import { WorkspaceFileSystem } from '@cloudflare/shell';
 import { createGit } from '@cloudflare/shell/git';
-import { getDefaultWorkspace } from '@flue/runtime/cloudflare';
+import { getDefaultWorkspace } from '../connectors/cloudflare-shell';
 
 const workspace = getDefaultWorkspace();
 if (!(await workspace.exists('/.hydrated'))) {
@@ -163,7 +163,7 @@ import {
   getDefaultWorkspace,
   getShellSandbox,
   hydrateFromBucket,
-} from '@flue/runtime/cloudflare';
+} from '../connectors/cloudflare-shell';
 
 const workspace = getDefaultWorkspace();
 if (!(await workspace.exists('/.hydrated'))) {

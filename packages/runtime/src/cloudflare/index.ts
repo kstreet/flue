@@ -1,13 +1,26 @@
 export { getVirtualSandbox } from './virtual-sandbox.ts';
 export type { VirtualSandboxOptions } from './virtual-sandbox.ts';
 
-export {
-	getShellSandbox,
-	getDefaultWorkspace,
-} from './shell-sandbox.ts';
-export type { GetShellSandboxOptions } from './shell-sandbox.ts';
+const CLOUDFLARE_SHELL_CONNECTOR_MIGRATION =
+	'Run `flue add @cloudflare/shell`, then import Cloudflare Shell helpers from your generated `connectors/cloudflare-shell` file.';
 
-export { hydrateFromBucket } from './hydrate.ts';
+export function getShellSandbox(..._args: unknown[]): never {
+	throw new Error(
+		`[flue] getShellSandbox() is no longer implemented by @flue/runtime/cloudflare because Cloudflare Shell sandboxes are project-owned. ${CLOUDFLARE_SHELL_CONNECTOR_MIGRATION}`,
+	);
+}
+
+export function getDefaultWorkspace(..._args: unknown[]): never {
+	throw new Error(
+		`[flue] getDefaultWorkspace() is no longer implemented by @flue/runtime/cloudflare because Cloudflare Shell sandboxes are project-owned. ${CLOUDFLARE_SHELL_CONNECTOR_MIGRATION}`,
+	);
+}
+
+export function hydrateFromBucket(..._args: unknown[]): never {
+	throw new Error(
+		`[flue] hydrateFromBucket() is no longer implemented by @flue/runtime/cloudflare because hydration belongs to the Cloudflare Shell connector. ${CLOUDFLARE_SHELL_CONNECTOR_MIGRATION}`,
+	);
+}
 
 export { cfSandboxToSessionEnv } from './cf-sandbox.ts';
 

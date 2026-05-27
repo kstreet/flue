@@ -1,5 +1,4 @@
-import { Type, createAgent, defineTool } from '@flue/runtime';
-import { fauxAssistantMessage, fauxText, fauxToolCall, registerFauxProvider } from '@earendil-works/pi-ai';
+import { Type, createAgent, defineTool, fauxAssistantMessage, fauxText, fauxToolCall, registerFauxProvider } from '@flue/runtime';
 import { bot } from '../chat.ts';
 
 export default createAgent(() => {

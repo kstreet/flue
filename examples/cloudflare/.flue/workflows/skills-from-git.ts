@@ -21,7 +21,7 @@ import { createGit } from '@cloudflare/shell/git';
 import {
 	getDefaultWorkspace,
 	getShellSandbox,
-} from '@flue/runtime/cloudflare';
+} from '../connectors/cloudflare-shell';
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();
 

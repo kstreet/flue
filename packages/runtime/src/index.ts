@@ -82,7 +82,7 @@ export type {
 	WebSocketServerMessage,
 } from './types.ts';
 
-export { Type } from '@earendil-works/pi-ai';
+export { Type, fauxAssistantMessage, fauxText, fauxToolCall, registerFauxProvider } from '@earendil-works/pi-ai';
 export { createTools, BUILTIN_TOOL_NAMES } from './agent.ts';
 export { defineTool } from './tool.ts';
 export { createAgent, defineAgentProfile } from './agent-definition.ts';

@@ -30,7 +30,7 @@ import {
 	getDefaultWorkspace,
 	getShellSandbox,
 	hydrateFromBucket,
-} from '@flue/runtime/cloudflare';
+} from '../connectors/cloudflare-shell';
 import * as v from 'valibot';
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();

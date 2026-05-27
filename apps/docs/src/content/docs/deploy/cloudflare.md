@@ -191,98 +191,37 @@ EOF`);
 
 The agent can use its built-in tools — grep, glob, read — to search and read these files. This is still running on a virtual sandbox (no container), so it's fast and cheap.
 
-## Workspace-backed agents
+## Support agents with context files
 
-Inline files work for small, static content. But for larger datasets — a knowledge base, documentation corpus, product catalog — you want persistent storage. On Cloudflare, the lightweight non-container path is [`@cloudflare/shell`](https://github.com/withastro/flue/blob/main/docs/cloudflare-shell.md): a durable SQLite-indexed `Workspace` plus a `code` tool that runs JavaScript against `state.*` in an isolated Worker.
-
-R2 is a good source for that workspace, but it is not a live filesystem mount. Hydrate the R2 objects you want into the Workspace before `init()`, then the agent operates on the Workspace. The basic R2 flow below uses Flue's Cloudflare helpers; install `@cloudflare/shell` directly if you want to construct custom Workspaces or hydrate from git.
-
-### The support agent pattern
-
-This is one of the most powerful patterns on Cloudflare: a support agent that searches a knowledge base to answer customer questions. The knowledge base can be stored in R2, hydrated once into the Workspace, and then searched through the `code` tool with `state.searchFiles`, `state.glob`, `state.readFile`, and related APIs.
+For support agents, you can seed Flue's default virtual sandbox with the knowledge required for a request. The agent can search and read these files using its built-in `grep`, `glob`, and `read` tools without provisioning a container or installing a connector.
 
 `.flue/workflows/support.ts`:
 
 ```typescript
 import { createAgent, type FlueContext, type WorkflowRouteHandler } from '@flue/runtime';
-import {
-  getDefaultWorkspace,
-  getShellSandbox,
-  hydrateFromBucket,
-} from '@flue/runtime/cloudflare';
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();
 
-export async function run({ init, payload, env }: FlueContext) {
-  const workspace = getDefaultWorkspace();
+const support = createAgent(() => ({ model: 'openrouter/moonshotai/kimi-k2.6' }));
 
-  if (!(await workspace.exists('/.hydrated'))) {
-    await hydrateFromBucket(workspace, env.KNOWLEDGE_BASE);
-    await workspace.writeFile('/.hydrated', new Date().toISOString());
-  }
-
-  const agent = createAgent(() => ({
-    sandbox: getShellSandbox({ workspace, loader: env.LOADER }),
-    model: 'openrouter/moonshotai/kimi-k2.6',
-  }));
-  const harness = await init(agent);
+export async function run({ init, payload }: FlueContext) {
+  const harness = await init(support);
   const session = await harness.session();
 
-  return await session.prompt(
-    `You are a support agent. Use the code tool to search the hydrated
-    workspace for articles relevant to this request, then write a helpful response.
+  await session.fs.mkdir('/workspace/articles', { recursive: true });
+  await session.fs.writeFile(
+    '/workspace/articles/reset-password.md',
+    '# Reset your password\n\nUse the account settings page to request a password reset email.',
+  );
 
-    Customer: ${payload.message}`,
-    {},
+  return await session.prompt(
+    `You are a support agent. Search the workspace for articles relevant
+    to this request, then write a helpful response.\n\nCustomer: ${payload.message}`,
   );
 }
 ```
 
-### Adding the bindings
-
-Add a Worker Loader binding and the R2 bucket to your project's `wrangler.jsonc` (at the root of your project, alongside `package.json`):
-
-```jsonc
-{
-  "name": "my-support-agent",
-  "compatibility_date": "2026-04-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "worker_loaders": [{ "binding": "LOADER" }],
-  "r2_buckets": [
-    {
-      "binding": "KNOWLEDGE_BASE",
-      "bucket_name": "my-knowledge-base",
-    },
-  ],
-}
-```
-
-Worker Loader is currently in beta. If `wrangler dev` local mode does not simulate `worker_loaders`, use `wrangler dev --remote` or deploy to a preview environment.
-
-When you run `flue build --target cloudflare`, Flue merges its own Durable Object bindings into this file and writes the composed config to `dist/wrangler.jsonc`. `wrangler deploy` picks that up automatically via a redirect at `.wrangler/deploy/config.json` — so you can keep editing only your root `wrangler.jsonc` and bindings like this R2 binding will flow through to deploy. You don't need to set `main` yourself; Flue owns the bundle entrypoint.
-
-Upload your knowledge base to R2 using Wrangler:
-
-```bash
-# Upload individual files
-wrangler r2 object put my-knowledge-base/articles/getting-started.md --file ./docs/getting-started.md
-
-# Or upload a directory
-for f in ./docs/**/*.md; do
-  key="articles/${f#./docs/}"
-  wrangler r2 object put "my-knowledge-base/$key" --file "$f"
-done
-```
-
-### Why this works well
-
-- **No container** — Still running on a virtual sandbox. Fast startup, low cost.
-- **Persistent data** — The workspace lives in Durable Object SQLite, with optional R2 spillover for large files.
-- **Explicit sources** — R2, git, or any other source can hydrate the workspace before the agent runs.
-- **Agent-native search** — The agent uses the `code` tool and `state.*` APIs to list, read, search, and edit files.
-- **Session persistence** — Because this deploys to Cloudflare Workers with Durable Objects, message history and session state are automatically persisted. A customer can revisit a support session days later and pick up where they left off.
-
-If you specifically need bucket keys to appear as filesystem paths, use `@cloudflare/sandbox` Containers with [`mountBucket`](https://developers.cloudflare.com/sandbox/guides/mount-buckets/) instead. That is the right tool for Linux shell commands and live bucket-mount semantics.
+This remains the default just-bash virtual sandbox: it starts quickly, supports shell and filesystem tools, and requires no Worker Loader binding. If an application needs durable external storage or a full Linux environment, choose and own a connector appropriate to that requirement.
 
 ## Connecting a remote sandbox
 
@@ -415,22 +354,21 @@ A deployment or code update can reset a Durable Object while an operation is run
 | --- | --- |
 | Direct attached agent HTTP/WebSocket prompt | No public agent run exists. If the attached request or socket is interrupted, Flue does not provide a run-resume API. |
 | Dispatched agent input | Durable delivery and deduplication are keyed by `dispatchId` and persisted session/delivery state, not by a run. |
-| Flue HTTP workflow invocation (`202`, SSE, or `?wait=result`) | Flue terminalizes the interrupted attempt and attempts to restart the workflow from its persisted payload as a new linked run. An attached SSE or synchronous response may fail; replacement work proceeds detached. |
-| Flue workflow WebSocket interaction | Outside the HTTP workflow durable-admission guarantee; an interrupted socket is not transparently resumed. |
+| Flue workflow invocation (`202`, SSE, `?wait=result`, or workflow WebSocket) | Flue terminalizes the interrupted attempt and attempts to restart the workflow from its persisted payload as a new linked run. An attached SSE, synchronous response, or WebSocket may fail; replacement work proceeds detached. |
 
-All Cloudflare HTTP workflow response modes use the same Fiber-backed durable admission path. The response mode controls only how the initiating caller observes the admitted run: immediate `202`, live SSE, or a synchronous result while the request remains connected.
+All Cloudflare workflow invocation transports use the same Fiber-backed durable admission path. The transport controls only how the initiating caller observes the admitted run: immediate `202`, live SSE, a synchronous result, or workflow WebSocket events while the connection remains available.
 
 Recovery is **at-least-once** where durable asynchronous processing or workflow restart applies. An interruption after an external action has begun can cause that action to execute again. For dispatched agent work, use `dispatchId` or an application-level idempotency key when coordinating external side effects. Direct attached prompts do not expose a run identifier. Because restarted workflows receive a new `runId`, workflow code should use an application-level idempotency key that remains stable across attempts.
 
-Flue persists HTTP workflow invocation payloads with workflow run records before admitted work starts so interrupted executions can restart and operators can inspect their original input through workflow run APIs. Workflow attempt records expose `restartedAsRunId` and `restartedFromRunId` links between interrupted and replacement attempts. Replacement admission is currently attempted once; a transient failure while submitting the replacement can still prevent recovery. Dispatched agent inputs are persisted as delivery/session state correlated by `dispatchId`, not as agent runs. Treat persisted inputs as durable application data: do not submit secrets or sensitive values unless your application retention and access policy permits storing them.
+Flue persists workflow invocation payloads with workflow run records before admitted work starts so interrupted executions can restart and operators can inspect their original input through workflow run APIs. Workflow attempt records expose `restartedAsRunId` and `restartedFromRunId` links between interrupted and replacement attempts. Replacement admission is currently attempted once; a transient failure while submitting the replacement can still prevent recovery. Dispatched agent inputs are persisted as delivery/session state correlated by `dispatchId`, not as agent runs. Treat persisted inputs as durable application data: do not submit secrets or sensitive values unless your application retention and access policy permits storing them.
 
-Flue HTTP workflows restart from the beginning after Durable Object interruption; they do not resume from checkpointed durable steps. For jobs that require durable step-level continuation rather than whole-invocation retry, implement those steps with [Cloudflare Workflows](https://developers.cloudflare.com/workflows/).
+Flue workflows restart from the beginning after Durable Object interruption; they do not resume from checkpointed durable steps. For jobs that require durable step-level continuation rather than whole-invocation retry, implement those steps with [Cloudflare Workflows](https://developers.cloudflare.com/workflows/).
 
 ## Sandbox context
 
 `AGENTS.md` and skills are optional workspace-context files that the agent reads from its sandbox at `init()` time. They live at conventional paths inside whatever sandbox the agent is using — Flue looks for `<cwd>/AGENTS.md` and `<cwd>/.agents/skills/<name>/SKILL.md`. Whatever's there gets loaded; whatever isn't, doesn't. Most agents don't need either to do useful work.
 
-If you want to use them, put them in your sandbox. How you do that depends on which sandbox you're using: hydrate them into a cf-shell Workspace from R2 or git before `init()`, `COPY` them in for a container, or write them in via `session.shell()` on a sandbox that supports shell execution.
+If you want to use them, put them in your sandbox. How you do that depends on which sandbox you're using: write them in via `session.shell()` or `session.fs` for the default virtual sandbox, or `COPY` them in for a container.
 
 **Skills** are reusable agent tasks defined as markdown files in `.agents/skills/`. They give the agent a focused instruction set for a specific job:
 
@@ -494,7 +432,6 @@ Here's the progression of sandbox types available on Cloudflare, from simplest t
 
 1. **Empty virtual sandbox** — `createAgent(() => ({ model: 'anthropic/claude-sonnet-4-6' }))`. Fast, cheap, stateless. Good for prompt-and-response agents.
 2. **Virtual sandbox with shell setup** — Use `session.shell()` to write files and configure the workspace. Still fast and cheap, good for agents that need small amounts of static context.
-3. **cf-shell Workspace sandbox** — `getShellSandbox({ workspace, loader })`. Durable SQLite-indexed Workspace, hydrated from R2/git/etc., searched and edited through the `code` tool and `state.*`. Ideal for Cloudflare-native knowledge bases and support agents without Linux dependencies.
-4. **Container sandbox** — Full Linux environment via `@cloudflare/sandbox`. For coding agents, complex dev environments, and anything that needs real system tools.
+3. **Container sandbox** — Full Linux environment via `@cloudflare/sandbox`. For coding agents, complex dev environments, and anything that needs real system tools.
 
 Start simple. Move up when you need to.
