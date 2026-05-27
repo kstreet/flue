@@ -26,7 +26,7 @@ const {
 } = Astro.props;
 const tableOfContents = headings.filter((heading) => heading.depth === 2 || heading.depth === 3);
 const currentSection = getDocsSection(currentSlug);
-const markdownUrl = `/${currentSlug}.md`;
+const markdownUrl = `${import.meta.env.BASE_URL}${currentSlug}/index.md`;
 const suggestChangesUrl = 'https://github.com/withastro/flue/issues/new';
 const reviewedDate = lastReviewedAt?.toISOString().slice(0, 10);
 const formattedReviewedDate = lastReviewedAt?.toLocaleDateString('en-US', {
@@ -47,6 +47,7 @@ const formattedReviewedDate = lastReviewedAt?.toLocaleDateString('en-US', {
 		<meta name="theme-color" content="#ffffff" />
 		<meta name="description" content={description ?? 'Flue framework documentation.'} />
 		<title>{title} | Flue</title>
+		<link rel="alternate" type="text/markdown" href={markdownUrl} />
 		<link rel="preconnect" href="https://fonts.googleapis.com" />
 		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 		<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
