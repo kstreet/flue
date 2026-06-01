@@ -104,7 +104,7 @@ function mergeSkillCatalog(
 const HEADLESS_PREAMBLE =
 	'You are running in headless mode with no human operator. Work autonomously — never ask questions, never wait for user input. Make your best judgment and proceed independently.';
 
-export function composeSystemPrompt(
+function composeSystemPrompt(
 	agentsMd: string,
 	skills: Record<string, Skill>,
 	env?: { cwd: string; directoryListing?: string[] },

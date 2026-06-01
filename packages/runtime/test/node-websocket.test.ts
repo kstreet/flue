@@ -1,206 +1,258 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { WebSocket } from 'ws';
 import {
 	createFlueContext,
 	InMemoryRunRegistry,
 	InMemoryRunStore,
 	InMemorySessionStore,
-	type RunRecord,
-	type RunStore,
 } from '../src/internal.ts';
-import {
-	createNodeWebSocketTransport,
-	type NodeWebSocketTransport,
-	type NodeWebSocketTransportOptions,
-} from '../src/node/index.ts';
-import type { FlueEvent, WebSocketServerMessage } from '../src/types.ts';
+import { createNodeWebSocketTransport, type NodeWebSocketTransport } from '../src/node/index.ts';
+import type { WebSocketServerMessage } from '../src/types.ts';
 
 const closeCallbacks: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
-	for (const close of closeCallbacks.splice(0)) await close();
+	const results = await Promise.allSettled(closeCallbacks.splice(0).map((close) => close()));
+	const errors = results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+	if (errors.length > 0) throw new AggregateError(errors, 'Failed to clean up test sockets.');
 });
 
-describe('Node WebSocket transport', () => {
-	it('keeps agent sockets open across sequential prompts', async () => {
-		const { socket, messages } = await startAgentSocket();
+describe('createNodeWebSocketTransport()', () => {
+	it('sends an agent ready frame when an exposed agent socket opens', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { messages } = await openTestSocket(transport, 'agent');
+
+		expect(await waitForMessage(messages, (message) => message.type === 'ready')).toEqual({
+			version: 1,
+			type: 'ready',
+			target: 'agent',
+			name: 'assistant',
+			instanceId: 'instance-1',
+		});
+	});
+
+	it('sends a workflow ready frame when an exposed workflow socket opens', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [],
+				workflows: [{ name: 'job', transports: { websocket: true } }],
+			},
+			agentHandlers: {},
+			workflowHandlers: { job: async (ctx) => ctx.payload },
+			createContext,
+		});
+		const { messages } = await openTestSocket(transport, 'workflow');
+
+		expect(await waitForMessage(messages, (message) => message.type === 'ready')).toEqual({
+			version: 1,
+			type: 'ready',
+			target: 'workflow',
+			name: 'job',
+		});
+	});
+
+	it('replies with pong when an agent socket receives ping', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
+		await waitForMessage(messages, (message) => message.type === 'ready');
+
+		socket.send(JSON.stringify({ version: 1, type: 'ping', requestId: 'ping-1' }));
+
+		expect(await waitForMessage(messages, (message) => message.type === 'pong')).toEqual({
+			version: 1,
+			type: 'pong',
+			requestId: 'ping-1',
+		});
+	});
+
+	it('streams started event and result frames when an agent socket receives a prompt', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: {
+				assistant: async (ctx) => {
+					ctx.emitEvent({ type: 'log', level: 'info', message: 'working' });
+					return ctx.payload;
+				},
+			},
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
 		await waitForMessage(messages, (message) => message.type === 'ready');
 
 		socket.send(
 			JSON.stringify({
 				version: 1,
 				type: 'prompt',
-				requestId: 'one',
-				message: 'first',
-				session: 'chat',
+				requestId: 'prompt-1',
+				message: 'Hello',
+				session: 'support',
 			}),
 		);
-		const first = await waitForMessage(
+		await waitForMessage(
 			messages,
-			(message) => message.type === 'result' && message.requestId === 'one',
+			(message) => message.type === 'result' && message.requestId === 'prompt-1',
 		);
-		expect(first).toMatchObject({ result: { message: 'first', session: 'chat' } });
-		expect(first).not.toHaveProperty('runId');
+
+		expect(messages).toMatchObject([
+			{
+				version: 1,
+				type: 'ready',
+				target: 'agent',
+				name: 'assistant',
+				instanceId: 'instance-1',
+			},
+			{ version: 1, type: 'started', requestId: 'prompt-1' },
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'prompt-1',
+				event: { type: 'log', level: 'info', message: 'working', instanceId: 'instance-1' },
+			},
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'prompt-1',
+				event: { type: 'idle', instanceId: 'instance-1' },
+			},
+			{
+				version: 1,
+				type: 'result',
+				requestId: 'prompt-1',
+				result: { message: 'Hello', session: 'support' },
+			},
+		]);
+	});
+
+	it('completes two sequential prompts while keeping the same agent socket reusable', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
+		await waitForMessage(messages, (message) => message.type === 'ready');
 
 		socket.send(
-			JSON.stringify({ version: 1, type: 'prompt', requestId: 'two', message: 'second' }),
+			JSON.stringify({ version: 1, type: 'prompt', requestId: 'prompt-1', message: 'First' }),
 		);
-		const second = await waitForMessage(
-			messages,
-			(message) => message.type === 'result' && message.requestId === 'two',
+		expect(
+			await waitForMessage(
+				messages,
+				(message) => message.type === 'result' && message.requestId === 'prompt-1',
+			),
+		).toEqual({
+			version: 1,
+			type: 'result',
+			requestId: 'prompt-1',
+			result: { message: 'First', session: undefined },
+		});
+		expect(socket.readyState).toBe(WebSocket.OPEN);
+
+		socket.send(
+			JSON.stringify({ version: 1, type: 'prompt', requestId: 'prompt-2', message: 'Second' }),
 		);
-		expect(second).toMatchObject({ result: { message: 'second' } });
-		expect(messages.filter((message) => message.type === 'started')).toHaveLength(2);
+		expect(
+			await waitForMessage(
+				messages,
+				(message) => message.type === 'result' && message.requestId === 'prompt-2',
+			),
+		).toEqual({
+			version: 1,
+			type: 'result',
+			requestId: 'prompt-2',
+			result: { message: 'Second', session: undefined },
+		});
 		expect(socket.readyState).toBe(WebSocket.OPEN);
 	});
 
-	it('returns structured errors for invalid agent messages without closing the socket', async () => {
-		const { socket, messages } = await startAgentSocket();
+	it('recovers when malformed JSON precedes a valid prompt on the same agent socket', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
 		await waitForMessage(messages, (message) => message.type === 'ready');
 
 		socket.send('{');
-		const error = await waitForMessage(messages, (message) => message.type === 'error');
-		expect(error).toMatchObject({ error: { type: 'invalid_request' } });
+
+		expect(await waitForMessage(messages, (message) => message.type === 'error')).toEqual({
+			version: 1,
+			type: 'error',
+			error: {
+				type: 'invalid_request',
+				message: 'Request is malformed.',
+				details: 'WebSocket messages must be valid JSON objects.',
+			},
+		});
+		expect(socket.readyState).toBe(WebSocket.OPEN);
+
+		socket.send(
+			JSON.stringify({ version: 1, type: 'prompt', requestId: 'prompt-valid', message: 'Hello' }),
+		);
+
+		expect(
+			await waitForMessage(
+				messages,
+				(message) => message.type === 'result' && message.requestId === 'prompt-valid',
+			),
+		).toEqual({
+			version: 1,
+			type: 'result',
+			requestId: 'prompt-valid',
+			result: { message: 'Hello', session: undefined },
+		});
 		expect(socket.readyState).toBe(WebSocket.OPEN);
 	});
 
-	it('terminates server sockets after transport-level errors', async () => {
-		const { socket, transport } = await startAgentSocket();
-		const accepted = [...transport.server.clients][0];
-		if (!accepted) throw new Error('Expected accepted server socket.');
-		accepted.emit('error', new Error('transport failed'));
-		await new Promise<void>((resolve) =>
-			socket.addEventListener('close', () => resolve(), { once: true }),
-		);
-		expect(transport.server.clients.size).toBe(0);
-	});
-
-	it('runs one workflow invocation through admission and closes normally after its result', async () => {
-		let admissions = 0;
-		const { socket, messages } = await startWorkflowSocket({
+	it('streams started event and result frames before closing when a workflow socket receives an invocation', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [],
+				workflows: [{ name: 'job', transports: { websocket: true } }],
+			},
+			agentHandlers: {},
 			workflowHandlers: {
 				job: async (ctx) => {
-					ctx.log.info('working');
+					ctx.emitEvent({ type: 'log', level: 'info', message: 'working' });
 					return ctx.payload;
 				},
 			},
-			startWorkflowAdmission: async (runId, run) => {
-				admissions++;
-				expect(runId.startsWith('workflow:job:')).toBe(true);
-				return run();
-			},
+			createContext,
+			runStore: new InMemoryRunStore(),
+			runRegistry: new InMemoryRunRegistry(),
 		});
-		await waitForMessage(messages, (message) => message.type === 'ready');
-		const closed = waitForClose(socket);
-
-		socket.send(
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-1', payload: { ok: true } }),
-		);
-		const result = await waitForMessage(
-			messages,
-			(message) => message.type === 'result' && message.requestId === 'work-1',
-		);
-
-		expect(admissions).toBe(1);
-		expect(messages[0]).toMatchObject({ type: 'ready', target: 'workflow', name: 'job' });
-		expect(messages[1]).toMatchObject({ type: 'started', requestId: 'work-1' });
-		expect(messages).toContainEqual(
-			expect.objectContaining({
-				type: 'event',
-				requestId: 'work-1',
-				event: expect.objectContaining({ type: 'run_start' }),
-			}),
-		);
-		expect(messages.findIndex((message) => message.type === 'started')).toBeLessThan(
-			messages.findIndex((message) => message.type === 'event'),
-		);
-		expect(result).toMatchObject({ result: { ok: true } });
-		expect(await closed).toEqual({ code: 1000, reason: 'Workflow completed' });
-	});
-
-	it('normalizes an omitted workflow payload for recoverable admission', async () => {
-		const runStore = new InMemoryRunStore();
-		const { socket, messages } = await startWorkflowSocket({ runStore });
-		await waitForMessage(messages, (message) => message.type === 'ready');
-
-		socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-empty' }));
-		const result = await waitForMessage(
-			messages,
-			(message) => message.type === 'result' && message.requestId === 'work-empty',
-		);
-		if (!('runId' in result) || typeof result.runId !== 'string')
-			throw new Error('Expected workflow run id.');
-
-		expect(await runStore.getRun(result.runId)).toMatchObject({ payload: {}, result: {} });
-		expect(result).toMatchObject({ result: {} });
-	});
-
-	it('preserves an explicit null workflow payload', async () => {
-		const runStore = new InMemoryRunStore();
-		const { socket, messages } = await startWorkflowSocket({ runStore });
-		await waitForMessage(messages, (message) => message.type === 'ready');
-
-		socket.send(
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-null', payload: null }),
-		);
-		const result = await waitForMessage(
-			messages,
-			(message) => message.type === 'result' && message.requestId === 'work-null',
-		);
-		if (!('runId' in result) || typeof result.runId !== 'string')
-			throw new Error('Expected workflow run id.');
-
-		expect(await runStore.getRun(result.runId)).toMatchObject({ payload: null, result: null });
-		expect(result).toMatchObject({ result: null });
-	});
-
-	it('does not send started when workflow execution scheduling rejects asynchronously', async () => {
-		let executions = 0;
-		const { socket, messages } = await startWorkflowSocket({
-			workflowHandlers: {
-				job: async () => {
-					executions++;
-					return null;
-				},
-			},
-			startWorkflowAdmission: async () => {
-				throw new Error('scheduler unavailable');
-			},
-		});
-		await waitForMessage(messages, (message) => message.type === 'ready');
-		const closed = waitForClose(socket);
-
-		socket.send(
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-scheduling-failed' }),
-		);
-		const error = await waitForMessage(
-			messages,
-			(message) => message.type === 'error' && message.requestId === 'work-scheduling-failed',
-		);
-
-		expect(executions).toBe(0);
-		expect(messages.some((message) => message.type === 'started')).toBe(false);
-		expect(error).toMatchObject({ runId: expect.stringMatching(/^workflow:job:/) });
-		expect(await closed).toEqual({ code: 1011, reason: 'Workflow failed' });
-	});
-
-	it('does not send started or execute a workflow when admission persistence fails', async () => {
-		let admissions = 0;
-		let executions = 0;
-		const { socket, messages } = await startWorkflowSocket({
-			workflowHandlers: {
-				job: async () => {
-					executions++;
-					return null;
-				},
-			},
-			startWorkflowAdmission: async (_runId, run) => {
-				admissions++;
-				return run();
-			},
-			runStore: new FailingRunStore(),
-		});
+		const { socket, messages } = await openTestSocket(transport, 'workflow');
 		await waitForMessage(messages, (message) => message.type === 'ready');
 		const closed = waitForClose(socket);
 
@@ -208,28 +260,185 @@ describe('Node WebSocket transport', () => {
 			JSON.stringify({
 				version: 1,
 				type: 'invoke',
-				requestId: 'work-failed',
-				payload: { ok: true },
+				requestId: 'workflow-1',
+				payload: { topic: 'support' },
 			}),
 		);
-		const error = await waitForMessage(
+		const started = await waitForMessage(
 			messages,
-			(message) => message.type === 'error' && message.requestId === 'work-failed',
+			(message) => message.type === 'started' && message.requestId === 'workflow-1',
+		);
+		if (!('runId' in started) || typeof started.runId !== 'string')
+			throw new Error('Expected workflow run id.');
+		await waitForMessage(
+			messages,
+			(message) => message.type === 'result' && message.requestId === 'workflow-1',
 		);
 
-		expect(admissions).toBe(0);
-		expect(executions).toBe(0);
-		expect(messages.some((message) => message.type === 'started')).toBe(false);
-		expect(error).toMatchObject({ runId: expect.stringMatching(/^workflow:job:/) });
-		expect(await closed).toEqual({ code: 1011, reason: 'Workflow failed' });
+		expect(messages).toMatchObject([
+			{ version: 1, type: 'ready', target: 'workflow', name: 'job' },
+			{ version: 1, type: 'started', requestId: 'workflow-1', runId: started.runId },
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'workflow-1',
+				runId: started.runId,
+				event: { type: 'run_start', runId: started.runId, payload: { topic: 'support' } },
+			},
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'workflow-1',
+				runId: started.runId,
+				event: { type: 'log', level: 'info', message: 'working' },
+			},
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'workflow-1',
+				runId: started.runId,
+				event: { type: 'idle' },
+			},
+			{
+				version: 1,
+				type: 'event',
+				requestId: 'workflow-1',
+				runId: started.runId,
+				event: {
+					type: 'run_end',
+					runId: started.runId,
+					result: { topic: 'support' },
+					isError: false,
+				},
+			},
+			{
+				version: 1,
+				type: 'result',
+				requestId: 'workflow-1',
+				runId: started.runId,
+				result: { topic: 'support' },
+			},
+		]);
+		expect(await closed).toEqual({ code: 1000, reason: 'Workflow completed' });
 	});
 
-	it('accepts one workflow invocation only', async () => {
+	it('sends a caller-safe workflow error without starting or executing when workflow admission rejects', async () => {
+		let executions = 0;
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+		try {
+			const transport = createNodeWebSocketTransport({
+				manifest: {
+					agents: [],
+					workflows: [{ name: 'job', transports: { websocket: true } }],
+				},
+				agentHandlers: {},
+				workflowHandlers: {
+					job: async () => {
+						executions++;
+						return null;
+					},
+				},
+				createContext,
+				startWorkflowAdmission: async () => {
+					throw new Error('private admission failure');
+				},
+				runStore: new InMemoryRunStore(),
+			});
+			const { socket, messages } = await openTestSocket(transport, 'workflow');
+			await waitForMessage(messages, (message) => message.type === 'ready');
+			const closed = waitForClose(socket);
+
+			socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'workflow-failed' }));
+
+			expect(
+				await waitForMessage(
+					messages,
+					(message) => message.type === 'error' && message.requestId === 'workflow-failed',
+				),
+			).toEqual({
+				version: 1,
+				type: 'error',
+				requestId: 'workflow-failed',
+				runId: expect.any(String),
+				error: {
+					type: 'internal_error',
+					message: 'An internal error occurred.',
+					details: 'The server encountered an unexpected error while handling this request.',
+				},
+			});
+			expect(messages).not.toContainEqual(
+				expect.objectContaining({ type: 'started', requestId: 'workflow-failed' }),
+			);
+			expect(executions).toBe(0);
+			expect(await closed).toEqual({ code: 1011, reason: 'Workflow failed' });
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+
+	it('sends a caller-safe workflow error without starting or executing when run creation rejects', async () => {
+		let executions = 0;
+		const runStore = new InMemoryRunStore();
+		vi.spyOn(runStore, 'createRun').mockRejectedValue(new Error('private run store failure'));
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+		try {
+			const transport = createNodeWebSocketTransport({
+				manifest: {
+					agents: [],
+					workflows: [{ name: 'job', transports: { websocket: true } }],
+				},
+				agentHandlers: {},
+				workflowHandlers: {
+					job: async () => {
+						executions++;
+						return null;
+					},
+				},
+				createContext,
+				runStore,
+			});
+			const { socket, messages } = await openTestSocket(transport, 'workflow');
+			await waitForMessage(messages, (message) => message.type === 'ready');
+			const closed = waitForClose(socket);
+
+			socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'workflow-failed' }));
+
+			expect(
+				await waitForMessage(
+					messages,
+					(message) => message.type === 'error' && message.requestId === 'workflow-failed',
+				),
+			).toEqual({
+				version: 1,
+				type: 'error',
+				requestId: 'workflow-failed',
+				runId: expect.any(String),
+				error: {
+					type: 'internal_error',
+					message: 'An internal error occurred.',
+					details: 'The server encountered an unexpected error while handling this request.',
+				},
+			});
+			expect(messages).not.toContainEqual(
+				expect.objectContaining({ type: 'started', requestId: 'workflow-failed' }),
+			);
+			expect(executions).toBe(0);
+			expect(await closed).toEqual({ code: 1011, reason: 'Workflow failed' });
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+
+	it('rejects a second workflow invocation when a workflow socket has already been invoked', async () => {
 		let executions = 0;
 		let release: (() => void) | undefined;
 		const runStore = new InMemoryRunStore();
-		const { socket, messages } = await startWorkflowSocket({
-			runStore,
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [],
+				workflows: [{ name: 'job', transports: { websocket: true } }],
+			},
+			agentHandlers: {},
 			workflowHandlers: {
 				job: async () => {
 					executions++;
@@ -239,25 +448,39 @@ describe('Node WebSocket transport', () => {
 					return null;
 				},
 			},
+			createContext,
+			runStore,
+			runRegistry: new InMemoryRunRegistry(),
 		});
+		const { socket, messages } = await openTestSocket(transport, 'workflow');
 		await waitForMessage(messages, (message) => message.type === 'ready');
-		socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-one' }));
+
+		socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'workflow-1' }));
 		const started = await waitForMessage(
 			messages,
-			(message) => message.type === 'started' && message.requestId === 'work-one',
+			(message) => message.type === 'started' && message.requestId === 'workflow-1',
 		);
 		if (!('runId' in started) || typeof started.runId !== 'string')
 			throw new Error('Expected workflow run id.');
 		const closed = waitForClose(socket);
+		socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'workflow-2' }));
 
 		try {
-			socket.send(JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-two' }));
-			const error = await waitForMessage(
-				messages,
-				(message) => message.type === 'error' && message.requestId === 'work-two',
-			);
-
-			expect(error).toMatchObject({ error: { type: 'invalid_request' } });
+			expect(
+				await waitForMessage(
+					messages,
+					(message) => message.type === 'error' && message.requestId === 'workflow-2',
+				),
+			).toEqual({
+				version: 1,
+				type: 'error',
+				requestId: 'workflow-2',
+				error: {
+					type: 'invalid_request',
+					message: 'Request is malformed.',
+					details: 'Workflow WebSocket connections accept one invocation only.',
+				},
+			});
 			expect(executions).toBe(1);
 			expect(await closed).toEqual({ code: 1008, reason: 'Workflow accepts one invocation only' });
 		} finally {
@@ -265,95 +488,213 @@ describe('Node WebSocket transport', () => {
 			await waitFor(async () => (await runStore.getRun(started.runId))?.status === 'completed');
 		}
 	});
+
+	it('rejects binary messages when an agent socket receives non-text input', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
+		await waitForMessage(messages, (message) => message.type === 'ready');
+		const closed = waitForClose(socket);
+
+		socket.send(Buffer.from('agent binary'));
+
+		expect(await waitForMessage(messages, (message) => message.type === 'error')).toEqual({
+			version: 1,
+			type: 'error',
+			error: {
+				type: 'invalid_request',
+				message: 'Request is malformed.',
+				details: 'Binary WebSocket messages are not supported.',
+			},
+		});
+		expect(await closed).toEqual({ code: 1003, reason: 'Binary messages are not supported' });
+	});
+
+	it('rejects binary messages when a workflow socket receives non-text input', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [],
+				workflows: [{ name: 'job', transports: { websocket: true } }],
+			},
+			agentHandlers: {},
+			workflowHandlers: { job: async (ctx) => ctx.payload },
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'workflow');
+		await waitForMessage(messages, (message) => message.type === 'ready');
+		const closed = waitForClose(socket);
+
+		socket.send(Buffer.from('workflow binary'));
+
+		expect(await waitForMessage(messages, (message) => message.type === 'error')).toEqual({
+			version: 1,
+			type: 'error',
+			error: {
+				type: 'invalid_request',
+				message: 'Request is malformed.',
+				details: 'Binary WebSocket messages are not supported.',
+			},
+		});
+		expect(await closed).toEqual({
+			code: 1003,
+			reason: 'Binary messages are not supported',
+		});
+	});
+
+	it('includes the prompt request id when an attached agent invocation fails', async () => {
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+		try {
+			const transport = createNodeWebSocketTransport({
+				manifest: {
+					agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+					workflows: [],
+				},
+				agentHandlers: {
+					assistant: async () => {
+						throw new Error('private failure');
+					},
+				},
+				workflowHandlers: {},
+				createContext,
+			});
+			const { socket, messages } = await openTestSocket(transport, 'agent');
+			await waitForMessage(messages, (message) => message.type === 'ready');
+
+			socket.send(
+				JSON.stringify({
+					version: 1,
+					type: 'prompt',
+					requestId: 'prompt-failed',
+					message: 'Hello',
+				}),
+			);
+
+			expect(
+				await waitForMessage(
+					messages,
+					(message) => message.type === 'error' && message.requestId === 'prompt-failed',
+				),
+			).toEqual({
+				version: 1,
+				type: 'error',
+				requestId: 'prompt-failed',
+				error: {
+					type: 'internal_error',
+					message: 'An internal error occurred.',
+					details: 'The server encountered an unexpected error while handling this request.',
+				},
+			});
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+
+	it('terminates the client socket and drains server clients when the server-side socket emits an error', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
+		await waitForMessage(messages, (message) => message.type === 'ready');
+		const closed = waitForClose(socket);
+		const [serverSocket] = transport.server.clients;
+		if (!serverSocket) throw new Error('Expected connected server-side WebSocket.');
+
+		serverSocket.emit('error', new Error('server-side socket failure'));
+
+		expect(await closed).toEqual({ code: 1006, reason: '' });
+		await waitFor(() => transport.server.clients.size === 0);
+	});
+
+	it('terminates connected sockets when the transport is closed', async () => {
+		const transport = createNodeWebSocketTransport({
+			manifest: {
+				agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
+				workflows: [],
+			},
+			agentHandlers: { assistant: async (ctx) => ctx.payload },
+			workflowHandlers: {},
+			createContext,
+		});
+		const { socket, messages } = await openTestSocket(transport, 'agent');
+		await waitForMessage(messages, (message) => message.type === 'ready');
+		const closed = waitForClose(socket);
+
+		await transport.close();
+
+		expect(await closed).toEqual({ code: 1006, reason: '' });
+		expect(transport.server.clients.size).toBe(0);
+	});
 });
 
-class FailingRunStore implements RunStore {
-	async createRun(_input: Parameters<RunStore['createRun']>[0]): Promise<void> {
-		throw new Error('create failed');
-	}
-
-	async endRun(_input: Parameters<RunStore['endRun']>[0]): Promise<void> {}
-
-	async appendEvent(_runId: string, _event: FlueEvent): Promise<void> {}
-
-	async getEvents(_runId: string, _fromIndex?: number): Promise<FlueEvent[]> {
-		return [];
-	}
-
-	async getRun(_runId: string): Promise<RunRecord | null> {
-		return null;
-	}
-}
-
-interface StartedSocket {
+interface TestSocket {
 	socket: WebSocket;
 	messages: WebSocketServerMessage[];
-	transport: NodeWebSocketTransport;
 }
 
-async function startAgentSocket(
-	options?: Partial<NodeWebSocketTransportOptions>,
-): Promise<StartedSocket> {
-	return startSocket('agent', options);
-}
-
-async function startWorkflowSocket(
-	options?: Partial<NodeWebSocketTransportOptions>,
-): Promise<StartedSocket> {
-	return startSocket('workflow', options);
-}
-
-async function startSocket(
+async function openTestSocket(
+	transport: NodeWebSocketTransport,
 	target: 'agent' | 'workflow',
-	options?: Partial<NodeWebSocketTransportOptions>,
-): Promise<StartedSocket> {
-	const transport = createTransport(options);
+): Promise<TestSocket> {
+	let server: ReturnType<typeof serve> | undefined;
+	let socket: WebSocket | undefined;
+	closeCallbacks.push(async () => {
+		const results = await Promise.allSettled([
+			closeSocket(socket),
+			transport.close(),
+			closeServer(server),
+		]);
+		const errors = results.flatMap((result) => (result.status === 'rejected' ? [result.reason] : []));
+		if (errors.length > 0) throw new AggregateError(errors, 'Failed to clean up test socket.');
+	});
+
 	const app = new Hono();
 	const path = target === 'agent' ? '/agents/:name/:id' : '/workflows/:name';
 	app.get(path, target === 'agent' ? transport.agentRoute : transport.workflowRoute);
-	const server = serve({ fetch: app.fetch, websocket: { server: transport.server }, port: 0 });
+	server = serve({ fetch: app.fetch, websocket: { server: transport.server }, port: 0 });
 	await new Promise<void>((resolve) => server.once('listening', resolve));
 	const address = server.address();
 	if (!address || typeof address === 'string') throw new Error('Expected test server address.');
-	const url = target === 'agent' ? '/agents/assistant/instance-1' : '/workflows/job';
-	const socket = new WebSocket(`ws://localhost:${address.port}${url}`);
+	const route = target === 'agent' ? '/agents/assistant/instance-1' : '/workflows/job';
+	socket = new WebSocket(`ws://localhost:${address.port}${route}`);
 	const messages = collectMessages(socket);
 	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener('open', () => resolve(), { once: true });
-		socket.addEventListener('error', () => reject(new Error('WebSocket failed before opening.')), {
+		socket?.addEventListener('open', () => resolve(), { once: true });
+		socket?.addEventListener('error', () => reject(new Error('WebSocket failed before opening.')), {
 			once: true,
 		});
 	});
-	closeCallbacks.push(async () => {
-		if (socket.readyState === WebSocket.OPEN) {
-			await new Promise<void>((resolve) => {
-				socket.addEventListener('close', () => resolve(), { once: true });
-				socket.close();
-			});
-		}
-		await new Promise<void>((resolve) => server.close(() => resolve()));
-	});
-	return { socket, messages, transport };
+	return { socket, messages };
 }
 
-function createTransport(
-	options: Partial<NodeWebSocketTransportOptions> = {},
-): NodeWebSocketTransport {
-	return createNodeWebSocketTransport({
-		manifest: {
-			agents: [{ name: 'assistant', transports: { websocket: true }, created: true }],
-			workflows: [{ name: 'job', transports: { websocket: true } }],
-		},
-		agentHandlers: {
-			assistant: async (ctx) => ctx.payload,
-		},
-		workflowHandlers: {
-			job: async (ctx) => ctx.payload,
-		},
-		createContext,
-		runStore: new InMemoryRunStore(),
-		runRegistry: new InMemoryRunRegistry(),
-		...options,
+async function closeSocket(socket: WebSocket | undefined): Promise<void> {
+	if (!socket || socket.readyState === WebSocket.CLOSED) return;
+	if (socket.readyState === WebSocket.CONNECTING) {
+		socket.terminate();
+		return;
+	}
+	await new Promise<void>((resolve) => {
+		socket.addEventListener('close', () => resolve(), { once: true });
+		if (socket.readyState === WebSocket.OPEN) socket.close();
+	});
+}
+
+async function closeServer(server: ReturnType<typeof serve> | undefined): Promise<void> {
+	if (!server) return;
+	await new Promise<void>((resolve, reject) => {
+		server.close((error) => (error ? reject(error) : resolve()));
 	});
 }
 

@@ -54,4 +54,20 @@ A single `review` task is enough review for most work. Additional reviews are al
 
 When writing new plans to disk, write them to `plans/` (gitignored intentionally) with a `YYYY-MM-DD` filename prefix.
 
+## Testing
+
+Use `<package>/test/` for the intentional active suite and `<package>/test-legacy/` for archived tests. Do not add tests to `test-legacy/`, and do not use legacy tests as the source of truth when designing active coverage. Archived tests may remain wired to explicit integration scripts temporarily while equivalent intentional coverage is designed.
+
+Design tests from observable contracts, not implementation structure. Prefer the highest practical public interface: user-facing behavior for public APIs and explicit consumer-facing behavior for stable internal subsystem boundaries. Do not test private helpers directly when their behavior is already exercised through a meaningful interface.
+
+Use `describe('someFunction()')` or `describe('SomeManager')` for the subject under test. Nested `describe()` blocks may name methods or narrower interface states. Name every test with the explicit `it('X when Y')` format so the expected behavior and condition are clear. A reasonable internal refactor should not require test changes unless the observable contract changes.
+
+Prefer explicit, self-contained `it()` blocks over deduplication. Copy-paste in tests is acceptable when it keeps each behavior readable in isolation and makes failures obvious. Avoid `it.each()` unless the cases are genuinely linear and remain clearer as a table. Avoid complex or nested helpers and dynamic test data flow.
+
+Use small fixture helpers only for incidental plumbing that is not under test, such as creating a default environment or initializing a session harness. Do not introduce helpers merely to save a few repeated lines when they construct the subject under test, behavior-relevant inputs, or expected outputs. Keep those values inline in each `it()` block so a reviewer can understand the behavior without following indirection and later edits cannot silently change several tests at once.
+
+Avoid extensive mocking, especially mocks of entire files, packages, or modules. Prefer testing through a real lightweight boundary, a small explicit fake for an injected interface, or a narrow transport fixture. If an existing design makes broad mocking unavoidable, treat that as a design smell: record the cleanup opportunity and document the temporary mock in the test.
+
+When adding or redesigning coverage, create and review behavior stubs before implementing assertions. Do not map old tests one-for-one: retain only behaviors that protect an intentional contract. Do not add tests solely to preserve deprecated behavior, migration guidance, or backwards-compatibility shims unless explicitly requested.
+
 Prefer changes that simplify the system over narrow patches that preserve accidental complexity. When fixing a bug or adding a feature, look for shared abstractions or obsolete branches that can be removed as part of the change, especially when this reduces distinct code paths or semantics. Do not expand into speculative redesign; call out meaningful user-facing behavior or migration tradeoffs before simplifying them away.

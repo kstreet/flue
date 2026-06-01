@@ -1,6 +1,6 @@
 import { ulid } from 'ulidx';
 
-export interface WorkflowRunIdParts {
+interface WorkflowRunIdParts {
 	workflowName: string;
 	runNonce: string;
 }

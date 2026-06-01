@@ -78,7 +78,7 @@ export function createAgentDispatchProcessor(options: {
 	};
 }
 
-export interface ValidateAgentDispatchAdmissionOptions {
+interface ValidateAgentDispatchAdmissionOptions {
 	input: DispatchInput;
 }
 
@@ -1012,7 +1012,7 @@ async function emitRunEnd(
 					endedAt,
 					isError: input.isError,
 					durationMs,
-					result,
+					result: input.isError ? result : normalizedResult,
 					error,
 				}),
 			)

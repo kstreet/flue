@@ -9,7 +9,6 @@ export interface DispatchInput {
 	acceptedAt: string;
 }
 
-export type { DispatchReceipt } from '../types.ts';
 
 export function assertCurrentDispatchInput(value: unknown): asserts value is DispatchInput {
 	if (value && typeof value === 'object' && 'targetAgent' in value) {

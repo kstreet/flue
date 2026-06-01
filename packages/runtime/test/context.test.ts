@@ -1,82 +1,447 @@
-import { describe, expect, it } from 'vitest';
-import { composeSystemPrompt, discoverSessionContext } from '../src/context.ts';
-import type { SessionEnv, SkillReference } from '../src/types.ts';
+import {
+	fauxAssistantMessage,
+	registerFauxProvider,
+	type FauxProviderRegistration,
+} from '@earendil-works/pi-ai';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createAgent } from '../src/index.ts';
+import { createFlueContext, InMemorySessionStore } from '../src/internal.ts';
+import type { FlueContextConfig } from '../src/internal.ts';
+import type { FlueEvent, SessionEnv } from '../src/types.ts';
 
-function createWorkspaceSkillEnv(skillMarkdown: string): SessionEnv {
-	const skillPath = '/workspace/.agents/skills/review/SKILL.md';
+const providers: FauxProviderRegistration[] = [];
+
+afterEach(() => {
+	for (const provider of providers.splice(0)) provider.unregister();
+});
+
+function createProvider(): FauxProviderRegistration {
+	const provider = registerFauxProvider({ provider: `context-test-${crypto.randomUUID()}` });
+	providers.push(provider);
+	return provider;
+}
+
+function createEnv({
+	cwd = '/repo',
+	files = {},
+}: { cwd?: string; files?: Record<string, string> } = {}): SessionEnv {
+	const normalize = (path: string) => {
+		const segments: string[] = [];
+		for (const segment of path.split('/')) {
+			if (!segment || segment === '.') continue;
+			if (segment === '..') segments.pop();
+			else segments.push(segment);
+		}
+		return `/${segments.join('/')}`;
+	};
+	const resolvePath = (path: string) => normalize(path.startsWith('/') ? path : `${cwd}/${path}`);
+
 	return {
-		cwd: '/workspace',
-		resolvePath: (path) => path,
+		cwd,
+		resolvePath,
 		exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-		readFile: async (path) => (path === skillPath ? skillMarkdown : ''),
+		readFile: async (path) => {
+			const content = files[resolvePath(path)];
+			if (content === undefined) throw new Error(`missing file: ${path}`);
+			return content;
+		},
 		readFileBuffer: async () => new Uint8Array(),
 		writeFile: async () => {},
-		stat: async (path) => ({
-			isFile: path === skillPath,
-			isDirectory: path.endsWith('/review'),
-			isSymbolicLink: false,
-			size: 0,
-			mtime: new Date(0),
-		}),
-		readdir: async (path) => (path === '/workspace/.agents/skills' ? ['review'] : []),
-		exists: async (path) =>
-			['/workspace/.agents/skills', '/workspace/.agents/skills/review', skillPath].includes(path),
+		stat: async (path) => {
+			const resolved = resolvePath(path);
+			return {
+				isFile: Object.hasOwn(files, resolved),
+				isDirectory: Object.keys(files).some((file) => file.startsWith(`${resolved}/`)),
+				isSymbolicLink: false,
+				size: 0,
+				mtime: new Date(0),
+			};
+		},
+		readdir: async (path) => {
+			const resolved = resolvePath(path);
+			const entries = new Set<string>();
+			for (const file of Object.keys(files)) {
+				if (!file.startsWith(`${resolved}/`)) continue;
+				const entry = file.slice(resolved.length + 1).split('/')[0];
+				if (entry) entries.add(entry);
+			}
+			return [...entries];
+		},
+		exists: async (path) => {
+			const resolved = resolvePath(path);
+			return (
+				Object.hasOwn(files, resolved) ||
+				Object.keys(files).some((file) => file.startsWith(`${resolved}/`))
+			);
+		},
 		mkdir: async () => {},
 		rm: async () => {},
 	};
 }
 
-describe('composeSystemPrompt', () => {
-	it('places agent instructions before discovered workspace context', () => {
-		const prompt = composeSystemPrompt(
-			'Workspace guidance.',
-			{},
-			{ cwd: '/workspace' },
-			'Agent instructions.',
-		);
+function createContext(overrides: Partial<FlueContextConfig> = {}) {
+	return createFlueContext({
+		id: 'context-instance',
+		payload: {},
+		env: {},
+		agentConfig: {
+			systemPrompt: '',
+			skills: {},
+			model: undefined,
+			resolveModel: () => undefined,
+		},
+		createDefaultEnv: async () => createEnv(),
+		defaultStore: new InMemorySessionStore(),
+		...overrides,
+	});
+}
 
-		expect(prompt.indexOf('Agent instructions.')).toBeLessThan(
-			prompt.indexOf('Workspace guidance.'),
+describe('FlueContext', () => {
+	it('exposes id payload env and request when the runtime creates a context', () => {
+		const payload = { issue: 'context visibility' };
+		const env = { API_KEY: 'test-key' };
+		const req = new Request('https://example.com/agents/reviewer', {
+			headers: { authorization: 'Bearer test-token' },
+		});
+		const ctx = createContext({ id: 'agent-reviewer', payload, env, req });
+
+		expect(ctx.id).toBe('agent-reviewer');
+		expect(ctx.payload).toBe(payload);
+		expect(ctx.env).toBe(env);
+		expect(ctx.req).toBe(req);
+	});
+
+	it('decorates workflow events with run identity when a context has a run id', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'workflow-instance', runId: 'run-123' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+
+		ctx.emitEvent({ type: 'idle' });
+
+		expect(events).toEqual([
+			{
+				type: 'idle',
+				runId: 'run-123',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('decorates agent events with instance identity when a context has no run id', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'agent-instance' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+
+		ctx.emitEvent({ type: 'idle' });
+
+		expect(events).toEqual([
+			{
+				type: 'idle',
+				instanceId: 'agent-instance',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('decorates agent events with dispatch identity when a context has a dispatch id', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'agent-instance', dispatchId: 'dispatch-123' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+
+		ctx.emitEvent({ type: 'idle' });
+
+		expect(events).toEqual([
+			{
+				type: 'idle',
+				instanceId: 'agent-instance',
+				dispatchId: 'dispatch-123',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('assigns increasing event indexes when a context emits multiple events', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'agent-indexed' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+
+		ctx.emitEvent({ type: 'idle' });
+		ctx.emitEvent({ type: 'idle' });
+		ctx.emitEvent({ type: 'idle' });
+
+		expect(events).toEqual([
+			{
+				type: 'idle',
+				instanceId: 'agent-indexed',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+			{
+				type: 'idle',
+				instanceId: 'agent-indexed',
+				eventIndex: 1,
+				timestamp: expect.any(String),
+			},
+			{
+				type: 'idle',
+				instanceId: 'agent-indexed',
+				eventIndex: 2,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('emits structured log events when application code calls context log methods', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'agent-logger' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+
+		ctx.log.info('Started review.', { phase: 'start' });
+		ctx.log.warn('Waiting for input.', { phase: 'wait' });
+		ctx.log.error('Review failed.', { phase: 'stop' });
+
+		expect(events).toEqual([
+			{
+				type: 'log',
+				level: 'info',
+				message: 'Started review.',
+				attributes: { phase: 'start' },
+				instanceId: 'agent-logger',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+			{
+				type: 'log',
+				level: 'warn',
+				message: 'Waiting for input.',
+				attributes: { phase: 'wait' },
+				instanceId: 'agent-logger',
+				eventIndex: 1,
+				timestamp: expect.any(String),
+			},
+			{
+				type: 'log',
+				level: 'error',
+				message: 'Review failed.',
+				attributes: { phase: 'stop' },
+				instanceId: 'agent-logger',
+				eventIndex: 2,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('serializes attributes.error when application code logs an Error instance', () => {
+		const events: FlueEvent[] = [];
+		const ctx = createContext({ id: 'agent-error-logger' });
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+		const error = new TypeError('invalid review input');
+
+		ctx.log.error('Review failed.', { error, attempt: 2 });
+
+		expect(events).toEqual([
+			{
+				type: 'log',
+				level: 'error',
+				message: 'Review failed.',
+				attributes: {
+					error: {
+						name: 'TypeError',
+						message: 'invalid review input',
+						stack: error.stack,
+					},
+					attempt: 2,
+				},
+				instanceId: 'agent-error-logger',
+				eventIndex: 0,
+				timestamp: expect.any(String),
+			},
+		]);
+	});
+
+	it('rejects duplicate harness names when init() is called twice with the same name', async () => {
+		const ctx = createContext();
+		const agent = createAgent(() => ({ model: false }));
+
+		await ctx.init(agent, { name: 'reviewer' });
+
+		await expect(ctx.init(agent, { name: 'reviewer' })).rejects.toThrow(
+			'[flue] init() has already been called with name "reviewer" in this request.',
 		);
-		expect(prompt).toContain('Working directory: /workspace');
+	});
+
+	it('allows distinct harnesses when init() is called with distinct names', async () => {
+		const ctx = createContext();
+		const agent = createAgent(() => ({ model: false }));
+
+		const reviewer = await ctx.init(agent, { name: 'reviewer' });
+		const writer = await ctx.init(agent, { name: 'writer' });
+
+		expect(reviewer.name).toBe('reviewer');
+		expect(writer.name).toBe('writer');
+	});
+
+	it('allows the same harness name to retry when an earlier initialization attempt fails', async () => {
+		let attempt = 0;
+		const ctx = createContext();
+		const agent = createAgent(() => ({
+			model: false,
+			sandbox: {
+				createSessionEnv: async () => {
+					attempt += 1;
+					if (attempt === 1) throw new Error('temporary sandbox failure');
+					return createEnv();
+				},
+			},
+		}));
+
+		await expect(ctx.init(agent, { name: 'reviewer' })).rejects.toThrow(
+			'temporary sandbox failure',
+		);
+		await expect(ctx.init(agent, { name: 'reviewer' })).resolves.toMatchObject({
+			name: 'reviewer',
+		});
 	});
 });
 
-describe('workspace skill discovery', () => {
-	it('advertises valid skill metadata without loading the instruction body into context', async () => {
-		const context = await discoverSessionContext(
-			createWorkspaceSkillEnv(
-				'---\nname: review\ndescription: Reviews changes.\n---\nSecret instructions.',
-			),
+describe('session context discovery', () => {
+	it('includes agent instructions and discovered AGENTS.md content when the initial model request begins', async () => {
+		const provider = createProvider();
+		provider.setResponses([fauxAssistantMessage('Reviewed.')]);
+		const events: FlueEvent[] = [];
+		const ctx = createContext({
+			agentConfig: {
+				systemPrompt: '',
+				skills: {},
+				model: undefined,
+				resolveModel: () => provider.getModel(),
+			},
+			createDefaultEnv: async () =>
+				createEnv({ files: { '/repo/AGENTS.md': 'Workspace review guidance.' } }),
+		});
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				instructions: 'Agent-specific review instructions.',
+			})),
 		);
+		const session = await harness.session();
 
-		expect(context.skills.review).toEqual({ name: 'review', description: 'Reviews changes.' });
-		expect(context.systemPrompt).toContain('Reviews changes.');
-		expect(context.systemPrompt).not.toContain('Secret instructions.');
+		await session.prompt('Review this workspace.');
+
+		const request = events.find(
+			(event): event is Extract<FlueEvent, { type: 'turn_request' }> =>
+				event.type === 'turn_request',
+		);
+		const systemPrompt = request?.input.systemPrompt ?? '';
+		expect(systemPrompt).toContain('Agent-specific review instructions.');
+		expect(systemPrompt).toContain('Workspace review guidance.');
+		expect(systemPrompt.indexOf('Agent-specific review instructions.')).toBeLessThan(
+			systemPrompt.indexOf('Workspace review guidance.'),
+		);
 	});
 
-	it('rejects workspace skills that violate the Agent Skills metadata contract', async () => {
-		await expect(
-			discoverSessionContext(
-				createWorkspaceSkillEnv('---\nname: other\ndescription: Reviews changes.\n---\nReview.'),
-			),
-		).rejects.toThrow('requires it to match directory "review"');
+	it('includes CLAUDE.md content when it exists beside AGENTS.md', async () => {
+		const provider = createProvider();
+		provider.setResponses([fauxAssistantMessage('Reviewed.')]);
+		const events: FlueEvent[] = [];
+		const ctx = createContext({
+			agentConfig: {
+				systemPrompt: '',
+				skills: {},
+				model: undefined,
+				resolveModel: () => provider.getModel(),
+			},
+			createDefaultEnv: async () =>
+				createEnv({
+					files: {
+						'/repo/AGENTS.md': 'Workspace review guidance.',
+						'/repo/CLAUDE.md': 'Claude-specific workspace guidance.',
+					},
+				}),
+		});
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+			})),
+		);
+		const session = await harness.session();
+
+		await session.prompt('Review this workspace.');
+
+		const request = events.find(
+			(event): event is Extract<FlueEvent, { type: 'turn_request' }> =>
+				event.type === 'turn_request',
+		);
+		const systemPrompt = request?.input.systemPrompt ?? '';
+		expect(systemPrompt).toContain('Workspace review guidance.');
+		expect(systemPrompt).toContain('Claude-specific workspace guidance.');
+		expect(systemPrompt.indexOf('Workspace review guidance.')).toBeLessThan(
+			systemPrompt.indexOf('Claude-specific workspace guidance.'),
+		);
 	});
 
-	it('rejects a workspace skill that collides with a registered packaged skill name', async () => {
-		const registered: SkillReference = {
-			__flueSkillReference: true,
-			id: 'skill:review:fixture',
-			name: 'review',
-			description: 'Packaged review.',
-		};
+	it('discovers context from the created-agent cwd when a relative cwd is configured', async () => {
+		const provider = createProvider();
+		provider.setResponses([fauxAssistantMessage('Reviewed.')]);
+		const events: FlueEvent[] = [];
+		const ctx = createContext({
+			agentConfig: {
+				systemPrompt: '',
+				skills: {},
+				model: undefined,
+				resolveModel: () => provider.getModel(),
+			},
+			createDefaultEnv: async () =>
+				createEnv({
+					cwd: '/repo',
+					files: {
+						'/repo/AGENTS.md': 'Root workspace guidance.',
+						'/repo/workspace/AGENTS.md': 'Nested workspace guidance.',
+					},
+				}),
+		});
+		ctx.setEventCallback((event) => {
+			events.push(event);
+		});
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				cwd: 'workspace',
+			})),
+		);
+		const session = await harness.session();
 
-		await expect(
-			discoverSessionContext(
-				createWorkspaceSkillEnv('---\nname: review\ndescription: Workspace review.\n---\nReview.'),
-				undefined,
-				[registered],
-			),
-		).rejects.toThrow('appears in both agent definition and workspace discovery');
+		await session.prompt('Review this workspace.');
+
+		const request = events.find(
+			(event): event is Extract<FlueEvent, { type: 'turn_request' }> =>
+				event.type === 'turn_request',
+		);
+		const systemPrompt = request?.input.systemPrompt ?? '';
+		expect(systemPrompt).toContain('Nested workspace guidance.');
+		expect(systemPrompt).toContain('Working directory: /repo/workspace');
+		expect(systemPrompt).not.toContain('Root workspace guidance.');
 	});
 });

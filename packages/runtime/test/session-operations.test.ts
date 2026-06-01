@@ -1,0 +1,444 @@
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	registerFauxProvider,
+	type FauxModelDefinition,
+	type FauxProviderRegistration,
+} from '@earendil-works/pi-ai';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createAgent, defineAgentProfile } from '../src/index.ts';
+import { createFlueContext, InMemorySessionStore } from '../src/internal.ts';
+import type { SessionData, SessionEnv, SessionStore } from '../src/types.ts';
+import { createNoopSessionEnv } from './fixtures/session-env.ts';
+
+const providers: FauxProviderRegistration[] = [];
+
+afterEach(() => {
+	for (const provider of providers.splice(0)) provider.unregister();
+});
+
+function createProvider(models?: FauxModelDefinition[]): FauxProviderRegistration {
+	const provider = registerFauxProvider({
+		provider: `session-operations-test-${crypto.randomUUID()}`,
+		models,
+	});
+	providers.push(provider);
+	return provider;
+}
+
+function createContext(
+	provider: FauxProviderRegistration,
+	options: { env?: SessionEnv; store?: SessionStore } = {},
+) {
+	return createFlueContext({
+		id: 'session-operations-instance',
+		payload: {},
+		env: {},
+		agentConfig: {
+			systemPrompt: '',
+			skills: {},
+			model: undefined,
+			resolveModel: (specifier) => {
+				if (!specifier) return undefined;
+				return provider.getModel(specifier.slice(specifier.indexOf('/') + 1));
+			},
+		},
+		createDefaultEnv: async () => options.env ?? createNoopSessionEnv(),
+		defaultStore: options.store ?? new InMemorySessionStore(),
+	});
+}
+
+class RecordingSessionStore implements SessionStore {
+	readonly records = new Map<string, SessionData>();
+
+	async save(id: string, data: SessionData): Promise<void> {
+		this.records.set(id, structuredClone(data));
+	}
+
+	async load(id: string): Promise<SessionData | null> {
+		return structuredClone(this.records.get(id) ?? null);
+	}
+
+	async delete(id: string): Promise<void> {
+		this.records.delete(id);
+	}
+}
+
+describe('session.prompt()', () => {
+	it('returns assistant text usage and model identity when a prompt completes', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		provider.setResponses([fauxAssistantMessage('Reviewed workspace.')]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const response = await session.prompt('Review this workspace.');
+
+		expect(response).toEqual({
+			text: 'Reviewed workspace.',
+			usage: {
+				input: expect.any(Number),
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: expect.any(Number),
+				totalTokens: expect.any(Number),
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			model: { provider: provider.getModel().provider, id: 'reviewer' },
+		});
+		expect(response.usage.input).toBeGreaterThan(0);
+		expect(response.usage.cacheWrite).toBeGreaterThan(0);
+		expect(response.usage.totalTokens).toBe(
+			response.usage.input +
+				response.usage.output +
+				response.usage.cacheRead +
+				response.usage.cacheWrite,
+		);
+	});
+
+	it('uses a call-level model when a prompt overrides the agent model', async () => {
+		const provider = createProvider([{ id: 'default-model' }, { id: 'override-model' }]);
+		const selectedModels: string[] = [];
+		provider.setResponses([
+			(_context, _options, _state, model) => {
+				selectedModels.push(model.id);
+				return fauxAssistantMessage('Used override.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/default-model` })),
+		);
+		const session = await harness.session();
+
+		const response = await session.prompt('Use the requested model.', {
+			model: `${provider.getModel().provider}/override-model`,
+		});
+
+		expect(selectedModels).toEqual(['override-model']);
+		expect(response.model).toEqual({ provider: provider.getModel().provider, id: 'override-model' });
+	});
+
+	it('rejects a model operation when neither the agent nor the call configures a model', async () => {
+		const provider = createProvider();
+		const ctx = createContext(provider);
+		const harness = await ctx.init(createAgent(() => ({ model: false })));
+		const session = await harness.session();
+
+		await expect(session.prompt('Review this workspace.')).rejects.toThrow(
+			'[flue] No model configured for this prompt() call. Pass `{ model: "provider-id/model-id" }` to this call or configure an agent model.',
+		);
+	});
+
+	it('applies a call-level thinking level when a prompt overrides the agent default', async () => {
+		const provider = createProvider([{ id: 'reasoner', reasoning: true }]);
+		const reasoningLevels: Array<string | undefined> = [];
+		provider.setResponses([
+			(_context, options) => {
+				reasoningLevels.push((options as { reasoning?: string } | undefined)?.reasoning);
+				return fauxAssistantMessage('Reasoned response.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/reasoner`,
+				thinkingLevel: 'low',
+			})),
+		);
+		const session = await harness.session();
+
+		await session.prompt('Think carefully.', { thinkingLevel: 'high' });
+
+		expect(reasoningLevels).toEqual(['high']);
+	});
+
+	it('rejects overlapping operations when a session is already running an operation', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		let markStarted: () => void = () => {};
+		let finishResponse: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const responseGate = new Promise<void>((resolve) => {
+			finishResponse = resolve;
+		});
+		provider.setResponses([
+			async () => {
+				markStarted();
+				await responseGate;
+				return fauxAssistantMessage('First response complete.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const first = session.prompt('Start the first review.');
+		await started;
+		let firstResponse: Awaited<typeof first>;
+
+		try {
+			await expect(session.prompt('Start a second review.')).rejects.toThrow(
+				'[flue] Session "default" is already running prompt. Start another session for parallel conversation branches.',
+			);
+		} finally {
+			finishResponse();
+			firstResponse = await first;
+		}
+		expect(firstResponse).toMatchObject({ text: 'First response complete.' });
+	});
+});
+
+describe('session.task()', () => {
+	it('isolates delegated conversation state from the parent session when task() is called', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		const taskRequests: string[][] = [];
+		provider.setResponses([
+			fauxAssistantMessage('Parent response.'),
+			(context) => {
+				taskRequests.push(
+					context.messages.map((message) =>
+						typeof message.content === 'string'
+							? message.content
+							: message.content
+									.map((block) => ('text' in block ? block.text : block.type))
+									.join('\n'),
+					),
+				);
+				return fauxAssistantMessage('Delegated response.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+		await session.prompt('Remember parent-only context.');
+
+		const response = await session.task('Review only the delegated input.');
+
+		expect(response.text).toBe('Delegated response.');
+		expect(taskRequests).toEqual([['Review only the delegated input.']]);
+	});
+
+	it('selects a declared subagent profile when task() receives an agent name', async () => {
+		const provider = createProvider([{ id: 'parent-model' }, { id: 'delegate-model' }]);
+		const selectedModels: string[] = [];
+		provider.setResponses([
+			(_context, _options, _state, model) => {
+				selectedModels.push(model.id);
+				return fauxAssistantMessage('Delegated profile response.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/parent-model`,
+				subagents: [
+					defineAgentProfile({
+						name: 'code-reviewer',
+						model: `${provider.getModel().provider}/delegate-model`,
+						instructions: 'Review code changes only.',
+					}),
+				],
+			})),
+		);
+		const session = await harness.session();
+
+		const response = await session.task('Review the patch.', { agent: 'code-reviewer' });
+
+		expect(selectedModels).toEqual(['delegate-model']);
+		expect(response).toMatchObject({
+			text: 'Delegated profile response.',
+			model: { provider: provider.getModel().provider, id: 'delegate-model' },
+		});
+	});
+
+	it('rejects an undeclared subagent when task() receives an unknown agent name', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/reviewer`,
+				subagents: [defineAgentProfile({ name: 'declared-reviewer', model: false })],
+			})),
+		);
+		const session = await harness.session();
+
+		await expect(session.task('Review the patch.', { agent: 'missing-reviewer' })).rejects.toThrow(
+			'[flue] Subagent "missing-reviewer" is not declared. Available: declared-reviewer.',
+		);
+		expect(provider.state.callCount).toBe(0);
+	});
+
+	it('scopes child work to a requested directory when task() receives a cwd', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		const taskSystemPrompts: Array<string | undefined> = [];
+		provider.setResponses([
+			(context) => {
+				taskSystemPrompts.push(context.systemPrompt);
+				return fauxAssistantMessage('Scoped review complete.');
+			},
+		]);
+		const ctx = createContext(provider, { env: createNoopSessionEnv({ cwd: '/repo' }) });
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const response = await session.task('Review the runtime package.', { cwd: 'packages/runtime' });
+
+		expect(response.text).toBe('Scoped review complete.');
+		expect(taskSystemPrompts).toHaveLength(1);
+		expect(taskSystemPrompts[0]).toContain('Working directory: /repo/packages/runtime');
+	});
+
+	it('removes persisted delegated-task state when the parent session is deleted', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		provider.setResponses([fauxAssistantMessage('Delegated response.')]);
+		const store = new RecordingSessionStore();
+		const ctx = createContext(provider, { store });
+		const harness = await ctx.init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/reviewer`,
+				persist: store,
+			})),
+		);
+		const session = await harness.session();
+
+		await session.task('Review the persisted child state.');
+
+		expect([...store.records.keys()]).toHaveLength(2);
+		expect([...store.records.keys()].some((key) => key.includes('task:default:'))).toBe(true);
+		await session.delete();
+		expect([...store.records.keys()]).toEqual([]);
+	});
+
+	it('rejects recursive delegation when task depth exceeds the supported limit', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		let rejectedTaskResult: unknown;
+		provider.setResponses([
+			fauxAssistantMessage(fauxToolCall('task', { prompt: 'Delegate depth two.' }), {
+				stopReason: 'toolUse',
+			}),
+			fauxAssistantMessage(fauxToolCall('task', { prompt: 'Delegate depth three.' }), {
+				stopReason: 'toolUse',
+			}),
+			fauxAssistantMessage(fauxToolCall('task', { prompt: 'Delegate depth four.' }), {
+				stopReason: 'toolUse',
+			}),
+			fauxAssistantMessage(fauxToolCall('task', { prompt: 'Delegate past the maximum.' }), {
+				stopReason: 'toolUse',
+			}),
+			(context) => {
+				rejectedTaskResult = context.messages.at(-1);
+				return fauxAssistantMessage('Stopped recursive delegation.');
+			},
+			fauxAssistantMessage('Depth three complete.'),
+			fauxAssistantMessage('Depth two complete.'),
+			fauxAssistantMessage('Depth one complete.'),
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const response = await session.task('Delegate depth one.');
+
+		expect(response.text).toBe('Depth one complete.');
+		expect(rejectedTaskResult).toMatchObject({
+			role: 'toolResult',
+			toolName: 'task',
+			isError: true,
+			content: [{ type: 'text', text: '[flue] Maximum task depth (4) exceeded.' }],
+		});
+	});
+});
+
+describe('CallHandle', () => {
+	it('rejects with AbortError when abort() cancels an active operation', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		provider.setResponses([
+			() => {
+				markStarted();
+				return fauxAssistantMessage('A response long enough to remain active during cancellation.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const operation = session.prompt('Begin a cancellable review.');
+		await started;
+		operation.abort('stop review');
+
+		await expect(operation).rejects.toMatchObject({ name: 'AbortError', message: 'stop review' });
+	});
+
+	it('rejects with AbortError when an external signal cancels an active operation', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		provider.setResponses([
+			() => {
+				markStarted();
+				return fauxAssistantMessage('A response long enough to remain active during cancellation.');
+			},
+		]);
+		const controller = new AbortController();
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const operation = session.prompt('Begin an externally cancellable review.', {
+			signal: controller.signal,
+		});
+		await started;
+		controller.abort('external stop');
+
+		await expect(operation).rejects.toMatchObject({ name: 'AbortError', message: 'external stop' });
+	});
+
+	it('exposes an aborted signal when abort() cancels an active operation', async () => {
+		const provider = createProvider([{ id: 'reviewer' }]);
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		provider.setResponses([
+			() => {
+				markStarted();
+				return fauxAssistantMessage('A response long enough to remain active during cancellation.');
+			},
+		]);
+		const ctx = createContext(provider);
+		const harness = await ctx.init(
+			createAgent(() => ({ model: `${provider.getModel().provider}/reviewer` })),
+		);
+		const session = await harness.session();
+
+		const operation = session.prompt('Begin a cancellable review.');
+		await started;
+		operation.abort('inspect signal');
+
+		expect(operation.signal.aborted).toBe(true);
+		expect(operation.signal.reason).toBe('inspect signal');
+		await expect(operation).rejects.toMatchObject({ name: 'AbortError', message: 'inspect signal' });
+	});
+});

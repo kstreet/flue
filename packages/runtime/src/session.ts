@@ -206,18 +206,6 @@ interface InternalTaskResult<T> {
 	cwd?: string;
 }
 
-/**
- * Read the per-call result schema option, accepting both the canonical
- * `result` field and the deprecated `schema` alias.
- */
-function resolveResultOption(
-	options: { result?: v.GenericSchema; schema?: v.GenericSchema } | undefined,
-): v.GenericSchema | undefined {
-	if (!options) return undefined;
-	if (options.result !== undefined) return options.result;
-	return options.schema;
-}
-
 interface InternalTaskOptions<S extends v.GenericSchema | undefined> extends TaskOptions<S> {
 	inheritedModel?: string;
 	inheritedThinkingLevel?: ThinkingLevel;
@@ -801,15 +789,11 @@ export class Session implements FlueSession {
 		text: string,
 		options: PromptOptions<S> & { result: S },
 	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
-	prompt<S extends v.GenericSchema>(
-		text: string,
-		options: PromptOptions<S> & { schema: S },
-	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
 	prompt(text: string, options?: PromptOptions): CallHandle<PromptResponse>;
 	prompt(text: string, options?: PromptOptions<v.GenericSchema | undefined>): CallHandle<any> {
 		return createCallHandle(options?.signal, (signal) =>
 			this.runOperation('prompt', signal, async () => {
-				const schema = resolveResultOption(options);
+				const schema = options?.result;
 				return this.runPromptCall({
 					promptText: buildPromptText(text, schema),
 					schema,
@@ -858,10 +842,6 @@ export class Session implements FlueSession {
 		skill: SkillReference | string,
 		options: SkillOptions<S> & { result: S },
 	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
-	skill<S extends v.GenericSchema>(
-		skill: SkillReference | string,
-		options: SkillOptions<S> & { schema: S },
-	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
 	skill(skill: SkillReference | string, options?: SkillOptions): CallHandle<PromptResponse>;
 	skill(
 		skill: SkillReference | string,
@@ -869,7 +849,7 @@ export class Session implements FlueSession {
 	): CallHandle<any> {
 		return createCallHandle(options?.signal, (signal) =>
 			this.runOperation('skill', signal, async () => {
-				const schema = resolveResultOption(options);
+				const schema = options?.result;
 
 				let promptText: string;
 				let skillName: string;
@@ -913,10 +893,6 @@ export class Session implements FlueSession {
 	task<S extends v.GenericSchema>(
 		text: string,
 		options: TaskOptions<S> & { result: S },
-	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
-	task<S extends v.GenericSchema>(
-		text: string,
-		options: TaskOptions<S> & { schema: S },
 	): CallHandle<PromptResultResponse<v.InferOutput<S>>>;
 	task(text: string, options?: TaskOptions): CallHandle<PromptResponse>;
 	task(text: string, options?: TaskOptions<v.GenericSchema | undefined>): CallHandle<any> {
@@ -1405,7 +1381,7 @@ export class Session implements FlueSession {
 				signal.addEventListener('abort', abortListener, { once: true });
 			}
 
-			const schema = resolveResultOption(options);
+			const schema = options?.result;
 			const childOptions: PromptOptions<v.GenericSchema | undefined> = {
 				model:
 					options?.model ?? (taskAgent?.model !== undefined ? undefined : options?.inheritedModel),
@@ -2007,9 +1983,7 @@ export class Session implements FlueSession {
 		callSite: string;
 		activePackagedSkills?: Record<string, PackagedSkillDirectory>;
 		signal: AbortSignal;
-	}): Promise<
-		PromptResponse | (Omit<PromptResultResponse<unknown>, 'result'> & { result: unknown })
-	> {
+	}): Promise<PromptResponse | PromptResultResponse<unknown>> {
 		const resultBundle = args.schema ? createResultTools(args.schema) : undefined;
 
 		return this.withCallOverrides(
@@ -2038,7 +2012,6 @@ export class Session implements FlueSession {
 					);
 					return {
 						data: result,
-						result,
 						usage: this.aggregateUsageSince(beforeLeafId),
 						model,
 					};

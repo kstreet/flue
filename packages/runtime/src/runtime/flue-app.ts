@@ -243,6 +243,11 @@ export function configureFlueRuntime(cfg: FlueRuntime): void {
 	configureErrorRendering({ devMode: cfg.devMode ?? false });
 }
 
+export function resetFlueRuntimeForTests(): void {
+	runtimeConfig = undefined;
+	configureErrorRendering({ devMode: false });
+}
+
 export function getFlueRuntime(): FlueRuntime | undefined {
 	return runtimeConfig;
 }

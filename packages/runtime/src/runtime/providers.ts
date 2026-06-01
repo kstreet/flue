@@ -106,6 +106,11 @@ export function registerProvider(providerId: string, registration: ProviderRegis
 	providersById.set(providerId, registration);
 }
 
+export function resetProvidersForTests(): void {
+	providersById.clear();
+	providerSettingsById.clear();
+}
+
 /** Whether a provider ID has already been registered. */
 export function hasRegisteredProvider(providerId: string): boolean {
 	return providersById.has(providerId);

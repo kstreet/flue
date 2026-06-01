@@ -31,6 +31,7 @@ export {
 	configureFlueRuntime,
 	createDefaultFlueApp,
 	dispatch,
+	resetFlueRuntimeForTests,
 	registeredAgentsForTransport,
 	registeredWorkflowsForTransport,
 } from './runtime/flue-app.ts';
@@ -82,7 +83,7 @@ export {
 export type { HandleRunRouteOptions } from './runtime/handle-run-routes.ts';
 export { handleRunRouteRequest } from './runtime/handle-run-routes.ts';
 export { generateWorkflowRunId, parseWorkflowRunId } from './runtime/ids.ts';
-export { hasRegisteredProvider } from './runtime/providers.ts';
+export { hasRegisteredProvider, resetProvidersForTests } from './runtime/providers.ts';
 export type {
 	ListRunsOpts,
 	ListRunsResponse,

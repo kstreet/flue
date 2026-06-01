@@ -1,247 +1,279 @@
-import type { AgentToolResult } from '@earendil-works/pi-agent-core';
-import { Type } from '@earendil-works/pi-ai';
-import { describe, expect, it } from 'vitest';
-import { createTools } from '../src/agent.ts';
-import { createAgent } from '../src/agent-definition.ts';
-import { Harness } from '../src/harness.ts';
-import { createFlueContext } from '../src/internal.ts';
-import { InMemorySessionStore } from '../src/session.ts';
-import { defineTool } from '../src/tool.ts';
-import type { AgentConfig, FlueEvent, SessionEnv } from '../src/types.ts';
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	registerFauxProvider,
+	type FauxProviderRegistration,
+} from '@earendil-works/pi-ai';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createAgent, defineTool, Type } from '../src/index.ts';
+import { createFlueContext, InMemorySessionStore } from '../src/internal.ts';
+import { createNoopSessionEnv } from './fixtures/session-env.ts';
 
-function createEnv(): SessionEnv {
-	return {
-		cwd: '/repo',
-		resolvePath: (path) => (path.startsWith('/') ? path : `/repo/${path}`),
-		exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-		readFile: async () => '',
-		readFileBuffer: async () => new Uint8Array(),
-		writeFile: async () => {},
-		stat: async () => ({
-			isFile: true,
-			isDirectory: false,
-			isSymbolicLink: false,
-			size: 0,
-			mtime: new Date(0),
-		}),
-		readdir: async () => [],
-		exists: async () => false,
-		mkdir: async () => {},
-		rm: async () => {},
-	};
+const providers: FauxProviderRegistration[] = [];
+
+afterEach(() => {
+	for (const provider of providers.splice(0)) provider.unregister();
+});
+
+function createProvider(): FauxProviderRegistration {
+	const provider = registerFauxProvider({ provider: `tool-test-${crypto.randomUUID()}` });
+	providers.push(provider);
+	return provider;
 }
 
-describe('defineTool', () => {
-	it('returns a shallow-frozen cloned tool value', async () => {
-		const parameters = Type.Object({ value: Type.String() });
-		const execute = async () => 'ok';
-		const input = {
-			name: 'lookup',
-			description: 'Look up a value.',
-			parameters,
-			execute,
-		};
+function createContext(provider: FauxProviderRegistration) {
+	return createFlueContext({
+		id: 'tool-test-instance',
+		payload: {},
+		env: {},
+		agentConfig: {
+			systemPrompt: '',
+			skills: {},
+			model: undefined,
+			resolveModel: () => provider.getModel(),
+		},
+		createDefaultEnv: async () => createNoopSessionEnv(),
+		defaultStore: new InMemorySessionStore(),
+	});
+}
 
-		const tool = defineTool(input);
+async function createSession(provider: FauxProviderRegistration) {
+	const harness = await createContext(provider).init(
+		createAgent(() => ({ model: `${provider.getModel().provider}/${provider.getModel().id}` })),
+	);
+	return harness.session();
+}
 
-		expect(tool).not.toBe(input);
-		expect(Object.isFrozen(tool)).toBe(true);
-		expect(tool.parameters).toBe(parameters);
-		expect(tool.execute).toBe(execute);
-		await expect(tool.execute({})).resolves.toBe('ok');
+describe('defineTool()', () => {
+	it('rejects a tool definition when its name is empty', () => {
+		expect(() =>
+			defineTool({
+				name: '',
+				description: 'Look up a value.',
+				parameters: Type.Object({}),
+				execute: async () => 'ok',
+			}),
+		).toThrow('name');
 	});
 
-	it.each([
-		[null, 'requires a tool definition object'],
-		[{ name: '', description: 'Desc', parameters: {}, execute: async () => 'ok' }, 'name'],
-		[{ name: 'tool', description: '', parameters: {}, execute: async () => 'ok' }, 'description'],
-		[
-			{ name: 'tool', description: 'Desc', parameters: null, execute: async () => 'ok' },
-			'parameters',
-		],
-		[{ name: 'tool', description: 'Desc', parameters: {}, execute: null }, 'execute'],
-	])('rejects invalid definitions %#', (value, message) => {
-		expect(() => defineTool(value as never)).toThrow(String(message));
+	it('rejects a tool definition when its description is empty', () => {
+		expect(() =>
+			defineTool({
+				name: 'lookup',
+				description: '',
+				parameters: Type.Object({}),
+				execute: async () => 'ok',
+			}),
+		).toThrow('description');
+	});
+
+	it('rejects a tool definition when its parameter schema is missing', () => {
+		expect(() =>
+			defineTool({
+				name: 'lookup',
+				description: 'Look up a value.',
+				execute: async () => 'ok',
+			} as never),
+		).toThrow('parameters');
+	});
+
+	it('rejects a tool definition when its execute callback is missing', () => {
+		expect(() =>
+			defineTool({
+				name: 'lookup',
+				description: 'Look up a value.',
+				parameters: Type.Object({}),
+			} as never),
+		).toThrow('execute');
 	});
 });
 
-describe('init capability extensions', () => {
-	it('adds harness-wide tools, skills, and subagents', async () => {
-		const initTool = defineTool({
-			name: 'init_tool',
-			description: 'Init.',
-			parameters: {},
-			execute: async () => 'init',
-		});
-		const ctx = createFlueContext({
-			id: 'init-extensions',
-			runId: undefined,
-			payload: {},
-			env: {},
-			agentConfig: {
-				systemPrompt: '',
-				skills: {},
-				model: undefined,
-				resolveModel: () => undefined,
-			},
-			createDefaultEnv: async () => createEnv(),
-			defaultStore: new InMemorySessionStore(),
-		});
-		const harness = await ctx.init(
-			createAgent(() => ({ model: false })),
-			{
-				tools: [initTool],
-				skills: [{ name: 'init_skill', description: 'Init skill.' }],
-				subagents: [{ name: 'init_agent', model: false }],
-			},
-		);
-		const session = await harness.session();
-		const config = Reflect.get(session, 'config') as AgentConfig;
-		const state = Reflect.get(session, 'harness') as { state: { tools: Array<{ name: string }> } };
-
-		expect(config.systemPrompt).toContain('init_skill');
-		expect(config.subagents).toHaveProperty('init_agent');
-		expect(state.state.tools.map((tool) => tool.name)).toContain('init_tool');
-	});
-
-	it('rejects duplicate capability names added through init', async () => {
-		const tool = defineTool({
-			name: 'lookup',
-			description: 'Lookup.',
-			parameters: {},
-			execute: async () => 'ok',
-		});
-		const ctx = createFlueContext({
-			id: 'init-duplicate',
-			runId: undefined,
-			payload: {},
-			env: {},
-			agentConfig: {
-				systemPrompt: '',
-				skills: {},
-				model: undefined,
-				resolveModel: () => undefined,
-			},
-			createDefaultEnv: async () => createEnv(),
-			defaultStore: new InMemorySessionStore(),
-		});
+describe('custom tools', () => {
+	it('rejects a custom tool when an operation activates a name reserved by a built-in tool', async () => {
+		const session = await createSession(createProvider());
 
 		await expect(
-			ctx.init(
-				createAgent(() => ({ model: false, tools: [tool] })),
-				{ tools: [tool] },
-			),
-		).rejects.toThrow('duplicate tool name "lookup"');
-	});
-});
-
-describe('subagent task selection', () => {
-	it('passes the selected declared subagent name through task params', async () => {
-		const calls: string[] = [];
-		const tools = createTools(createEnv(), {
-			subagents: {
-				code_review: { name: 'code_review', model: false },
-			},
-			task: async (params): Promise<AgentToolResult<any>> => {
-				calls.push(params.agent ?? 'generic');
-				return { content: [{ type: 'text', text: 'ok' }], details: {} };
-			},
-		});
-
-		const taskTool = tools.find((tool) => tool.name === 'task');
-		expect(taskTool).toBeDefined();
-		if (!taskTool) throw new Error('task tool missing');
-		await taskTool.execute('tool-1', { prompt: 'Review this.', agent: 'code_review' });
-		expect(calls).toEqual(['code_review']);
+			session.prompt('Use the tool.', {
+				tools: [
+					defineTool({
+						name: 'bash',
+						description: 'Run bash.',
+						parameters: Type.Object({}),
+						execute: async () => 'ok',
+					}),
+				],
+			}),
+		).rejects.toThrow('conflicts with a built-in tool');
 	});
 
-	it('uses named subagent instructions, skills, and tools instead of parent defaults', async () => {
-		const parentTool = defineTool({
-			name: 'parent_tool',
-			description: 'Parent.',
-			parameters: {},
-			execute: async () => 'parent',
-		});
-		const childTool = defineTool({
-			name: 'child_tool',
-			description: 'Child.',
-			parameters: {},
-			execute: async () => 'child',
-		});
-		const config: AgentConfig = {
-			systemPrompt: 'parent prompt',
-			instructions: 'Parent instructions.',
-			definitionSkills: [{ name: 'parent_skill', description: 'Parent skill.' }],
-			skills: {},
-			subagents: {
-				delegate: {
-					name: 'delegate',
-					instructions: 'Child instructions.',
-					skills: [{ name: 'child_skill', description: 'Child skill.' }],
-					tools: [childTool],
-				},
-			},
-			model: undefined,
-			resolveModel: () => undefined,
-		};
-		const harness = new Harness(
-			'instance',
-			'default',
-			config,
-			createEnv(),
-			new InMemorySessionStore(),
-			undefined,
-			[parentTool],
-		);
-		const parent = await harness.session();
-		const createTaskSession = Reflect.get(harness, 'createTaskSession').bind(harness) as (
-			options: any,
-		) => Promise<any>;
-		const child = await createTaskSession({
-			parentSession: parent.name,
-			taskId: 'task-agent-defaults',
-			parentEnv: createEnv(),
-			agent: config.subagents?.delegate,
-			depth: 1,
-		});
-		const childConfig = Reflect.get(child, 'config') as AgentConfig;
-		const childHarness = Reflect.get(child, 'harness') as {
-			state: { tools: Array<{ name: string }> };
-		};
-
-		expect(childConfig.systemPrompt).toContain('Child instructions.');
-		expect(childConfig.systemPrompt).toContain('child_skill');
-		expect(childConfig.systemPrompt).not.toContain('Parent instructions.');
-		expect(childConfig.systemPrompt).not.toContain('parent_skill');
-		expect(childHarness.state.tools.map((tool) => tool.name)).toContain('child_tool');
-		expect(childHarness.state.tools.map((tool) => tool.name)).not.toContain('parent_tool');
-	});
-
-	it('rejects unknown selected subagents before task lifecycle events', async () => {
-		const events: FlueEvent[] = [];
-		const harness = new Harness(
-			'instance',
-			'default',
-			{
-				systemPrompt: '',
-				skills: {},
-				subagents: {},
-				model: undefined,
-				resolveModel: () => undefined,
-			},
-			createEnv(),
-			new InMemorySessionStore(),
-			(event) => {
-				events.push(event);
-			},
+	it('rejects duplicate custom tool names when an operation assembles its active tools', async () => {
+		const provider = createProvider();
+		const harness = await createContext(provider).init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				tools: [
+					defineTool({
+						name: 'lookup',
+						description: 'Look up a value.',
+						parameters: Type.Object({}),
+						execute: async () => 'ok',
+					}),
+				],
+			})),
 		);
 		const session = await harness.session();
 
-		await expect(session.task('Delegate.', { agent: 'missing' })).rejects.toThrow(
-			'Subagent "missing" is not declared',
+		await expect(
+			session.prompt('Use the tool.', {
+				tools: [
+					defineTool({
+						name: 'lookup',
+						description: 'Look up another value.',
+						parameters: Type.Object({}),
+						execute: async () => 'ok',
+					}),
+				],
+			}),
+		).rejects.toThrow('Duplicate custom tool name "lookup"');
+	});
+
+	it('exposes agent-level custom tools when a model operation begins', async () => {
+		const provider = createProvider();
+		const activeToolNames: string[] = [];
+		provider.setResponses([
+			(context) => {
+				activeToolNames.push(...(context.tools ?? []).map((tool) => tool.name));
+				return fauxAssistantMessage('Done.');
+			},
+		]);
+		const harness = await createContext(provider).init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				tools: [
+					defineTool({
+						name: 'lookup',
+						description: 'Look up a value.',
+						parameters: Type.Object({}),
+						execute: async () => 'ok',
+					}),
+				],
+			})),
 		);
-		expect(events.filter((event) => event.type === 'task_start' || event.type === 'task')).toEqual(
-			[],
+		const session = await harness.session();
+
+		await session.prompt('List your tools.');
+
+		expect(activeToolNames).toContain('lookup');
+	});
+
+	it('exposes call-level custom tools only when the receiving operation begins', async () => {
+		const provider = createProvider();
+		const activeToolNames: string[][] = [];
+		provider.setResponses([
+			(context) => {
+				activeToolNames.push((context.tools ?? []).map((tool) => tool.name));
+				return fauxAssistantMessage('First response.');
+			},
+			(context) => {
+				activeToolNames.push((context.tools ?? []).map((tool) => tool.name));
+				return fauxAssistantMessage('Second response.');
+			},
+		]);
+		const session = await createSession(provider);
+
+		await session.prompt('Answer without the call tool.');
+		await session.prompt('Answer with the call tool.', {
+			tools: [
+				defineTool({
+					name: 'lookup',
+					description: 'Look up a value.',
+					parameters: Type.Object({}),
+					execute: async () => 'ok',
+				}),
+			],
+		});
+
+		expect(activeToolNames[0]).not.toContain('lookup');
+		expect(activeToolNames[1]).toContain('lookup');
+	});
+
+	it('forwards validated arguments and the operation abort signal when a model invokes a custom tool', async () => {
+		const provider = createProvider();
+		provider.setResponses([
+			fauxAssistantMessage(fauxToolCall('lookup', { count: '2' } as never), {
+				stopReason: 'toolUse',
+			}),
+		]);
+		let receivedArgs: Record<string, unknown> | undefined;
+		let receivedSignal: AbortSignal | undefined;
+		let markStarted: () => void = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const lookup = defineTool({
+			name: 'lookup',
+			description: 'Look up a count.',
+			parameters: Type.Object({ count: Type.Number() }),
+			execute: async (args, signal) => {
+				receivedArgs = args;
+				receivedSignal = signal;
+				markStarted();
+				await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve()));
+				return 'interrupted';
+			},
+		});
+		const harness = await createContext(provider).init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				tools: [lookup],
+			})),
 		);
+		const session = await harness.session();
+
+		const operation = session.prompt('Look up two values.');
+		await started;
+		operation.abort('stop');
+
+		await expect(operation).rejects.toMatchObject({ name: 'AbortError' });
+		expect(receivedArgs).toEqual({ count: 2 });
+		expect(receivedSignal).toBeInstanceOf(AbortSignal);
+		expect(receivedSignal?.aborted).toBe(true);
+	});
+
+	it('returns callback output to the model when a custom tool completes', async () => {
+		const provider = createProvider();
+		const execute = vi.fn(async () => 'Found the requested value.');
+		let modelToolResult: unknown;
+		provider.setResponses([
+			fauxAssistantMessage(fauxToolCall('lookup', { query: 'flue' }), { stopReason: 'toolUse' }),
+			(context) => {
+				modelToolResult = context.messages.at(-1);
+				return fauxAssistantMessage('Lookup complete.');
+			},
+		]);
+		const lookup = defineTool({
+			name: 'lookup',
+			description: 'Look up a value.',
+			parameters: Type.Object({ query: Type.String() }),
+			execute,
+		});
+		const harness = await createContext(provider).init(
+			createAgent(() => ({
+				model: `${provider.getModel().provider}/${provider.getModel().id}`,
+				tools: [lookup],
+			})),
+		);
+		const session = await harness.session();
+
+		const result = await session.prompt('Look up flue.');
+
+		expect(execute).toHaveBeenCalledWith({ query: 'flue' }, expect.any(AbortSignal));
+		expect(modelToolResult).toMatchObject({
+			role: 'toolResult',
+			toolName: 'lookup',
+			content: [{ type: 'text', text: 'Found the requested value.' }],
+			isError: false,
+		});
+		expect(result.text).toBe('Lookup complete.');
 	});
 });

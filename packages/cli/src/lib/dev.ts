@@ -585,7 +585,7 @@ class CloudflareReloader implements DevReloader {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-export function isSourceStructurePath(root: string, sourceRoot: string, relPath: string): boolean {
+function isSourceStructurePath(root: string, sourceRoot: string, relPath: string): boolean {
 	const prefix = path.relative(root, sourceRoot).replace(/\\/g, '/');
 	const sourceRelative = prefix
 		? relPath.startsWith(`${prefix}/`)

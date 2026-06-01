@@ -1,487 +1,492 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '../src/agent-definition.ts';
 import { Harness } from '../src/harness.ts';
-import { dispatch } from '../src/index.ts';
+import { dispatch, observe } from '../src/index.ts';
 import {
 	configureFlueRuntime,
 	createAgentDispatchProcessor,
 	createFlueContext,
 	type DispatchInput,
 	InMemoryDispatchQueue,
-	InMemoryRunStore,
 	InMemorySessionStore,
-	invokeDirectAttached,
-	validateAgentDispatchAdmission,
+	resetFlueRuntimeForTests,
 } from '../src/internal.ts';
-import type { AgentConfig, FlueHarness, FlueSession, SessionEnv } from '../src/types.ts';
+import type { AgentConfig, FlueHarness, FlueSession } from '../src/types.ts';
+import { createNoopSessionEnv } from './fixtures/session-env.ts';
 
-describe('global dispatch', () => {
-	it('dispatches by registered agent name and defaults the target session', async () => {
-		const dispatches: DispatchInput[] = [];
-		const queue = new InMemoryDispatchQueue({
-			process(input) {
-				dispatches.push(input);
-			},
-		});
+afterEach(() => {
+	resetFlueRuntimeForTests();
+});
 
-		configureFlueRuntime({
-			target: 'node',
-			handlers: {},
-			dispatchQueue: queue,
-			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
-		});
-
-		const receipt = await dispatch({
-			agent: 'moderator',
-			id: 'guild:1',
-			input: { type: 'flagged' },
-		});
-		await new Promise((resolve) => setTimeout(resolve, 0));
-
-		expect(receipt).toMatchObject({
-			dispatchId: expect.any(String),
-			acceptedAt: expect.any(String),
-		});
-		expect(dispatches).toHaveLength(1);
-		expect(dispatches[0]).toMatchObject({
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'default',
-			input: { type: 'flagged' },
-		});
-		expect(dispatches[0]).not.toHaveProperty('targetAgent');
-	});
-
-	it('snapshots input at admission time and validates named dispatch requests', async () => {
-		const dispatches: DispatchInput[] = [];
-		const input = { nested: { count: 1 } };
-		configureFlueRuntime({
-			target: 'node',
-			dispatchQueue: new InMemoryDispatchQueue({
-				process(item) {
-					dispatches.push(item);
-				},
-			}),
-			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
-		});
-
-		await dispatch({ agent: 'moderator', id: 'guild:1', input });
-		input.nested.count = 2;
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(dispatches[0]?.input).toEqual({ nested: { count: 1 } });
-		await expect(dispatch({ agent: 'missing', id: 'guild:1', input: null })).rejects.toThrow(
-			'target agent "missing" is not registered',
-		);
+describe('dispatch()', () => {
+	it('rejects calls when the runtime has not been configured', async () => {
 		await expect(
-			dispatch({ agent: 'moderator', id: 'guild:1', input: { fn: () => 'nope' } }),
-		).rejects.toThrow('must not contain function values');
+			dispatch({ agent: 'moderator', id: 'guild:unconfigured', input: { type: 'flagged' } }),
+		).rejects.toThrow('dispatch() called before runtime was configured');
 	});
 
-	it('dispatches by a discovered created-agent identity and rejects undiscovered identities', async () => {
-		const agent = createAgent(() => ({ model: false }));
-		const localAgent = createAgent(() => ({ model: false }));
-		const dispatches: DispatchInput[] = [];
+	it('returns an admission receipt before model processing completes when a named agent dispatch is accepted', async () => {
+		let releaseProcessing: (() => void) | undefined;
+		const processingPending = new Promise<void>((resolve) => {
+			releaseProcessing = resolve;
+		});
+		let processingCompleted = false;
 		configureFlueRuntime({
 			target: 'node',
 			dispatchQueue: new InMemoryDispatchQueue({
-				process(input) {
-					dispatches.push(input);
+				async process() {
+					await processingPending;
+					processingCompleted = true;
 				},
 			}),
-			resolveDispatchAgentName: (candidate) => (candidate === agent ? 'moderator' : undefined),
 			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
 		});
 
-		await dispatch(agent, { id: 'guild:1', session: 'case:1', input: { type: 'created' } });
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(dispatches[0]).toMatchObject({
-			agent: 'moderator',
-			session: 'case:1',
-			input: { type: 'created' },
+		try {
+			const receipt = await dispatch({
+				agent: 'moderator',
+				id: 'guild:admission',
+				session: 'case:admission',
+				input: { type: 'flagged', reportId: 'report:admission' },
+			});
+
+			expect(receipt).toEqual({
+				dispatchId: expect.any(String),
+				acceptedAt: expect.any(String),
+			});
+			expect(processingCompleted).toBe(false);
+		} finally {
+			releaseProcessing?.();
+		}
+		await vi.waitFor(() => {
+			expect(processingCompleted).toBe(true);
 		});
-		await expect(dispatch(localAgent, { id: 'guild:1', input: null })).rejects.toThrow(
-			'not a discovered default-exported agent',
-		);
 	});
 
-	it('admits dispatch through a configured Cloudflare target forwarding queue', async () => {
-		const dispatches: DispatchInput[] = [];
+	it('resolves a discovered agent name when dispatch() receives a created agent target', async () => {
+		const moderator = createAgent(() => ({ model: false }));
+		const admitted: DispatchInput[] = [];
 		configureFlueRuntime({
-			target: 'cloudflare',
+			target: 'node',
 			dispatchQueue: {
 				async enqueue(input) {
-					dispatches.push(input);
+					admitted.push(input);
+					return { dispatchId: input.dispatchId, acceptedAt: input.acceptedAt };
+				},
+			},
+			resolveDispatchAgentName: (candidate) => (candidate === moderator ? 'moderator' : undefined),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await dispatch(moderator, {
+			id: 'guild:created',
+			session: 'case:created',
+			input: { type: 'flagged', reportId: 'report:created' },
+		});
+
+		expect(admitted).toMatchObject([
+			{
+				agent: 'moderator',
+				id: 'guild:created',
+				session: 'case:created',
+				input: { type: 'flagged', reportId: 'report:created' },
+			},
+		]);
+	});
+
+	it('rejects a created agent target when the built application cannot resolve its identity', async () => {
+		const localModerator = createAgent(() => ({ model: false }));
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			resolveDispatchAgentName: () => undefined,
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch(localModerator, {
+				id: 'guild:local',
+				input: { type: 'flagged', reportId: 'report:local' },
+			}),
+		).rejects.toThrow('not a discovered default-exported agent');
+	});
+
+	it('defaults the session name when dispatch() receives no session', async () => {
+		const admitted: DispatchInput[] = [];
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: {
+				async enqueue(input) {
+					admitted.push(input);
 					return { dispatchId: input.dispatchId, acceptedAt: input.acceptedAt };
 				},
 			},
 			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
 		});
 
-		const receipt = await dispatch({ agent: 'moderator', id: 'guild:1', input: null });
-		expect(receipt).toMatchObject({
-			dispatchId: expect.any(String),
-			acceptedAt: expect.any(String),
-		});
-		expect(dispatches[0]).toMatchObject({
+		await dispatch({
 			agent: 'moderator',
-			id: 'guild:1',
-			session: 'default',
-			input: null,
+			id: 'guild:default-session',
+			input: { type: 'flagged', reportId: 'report:default-session' },
 		});
-	});
 
-	it('processes dispatches by waking the target instance and session', async () => {
-		const processed: DispatchInput[] = [];
-		const sessions: string[] = [];
-		const events: string[] = [];
-		const processor = createAgentDispatchProcessor({
-			agents: {
-				moderator: createAgent(({ id, payload }) => {
-					expect(id).toBe('guild:1');
-					expect(payload).toBeUndefined();
-					return { model: false };
-				}),
+		expect(admitted).toMatchObject([
+			{
+				agent: 'moderator',
+				id: 'guild:default-session',
+				session: 'default',
+				input: { type: 'flagged', reportId: 'report:default-session' },
 			},
-			createContext: (...args) => {
-				const ctx = createTestContext(...args);
-				ctx.initializeCreatedAgent = async () => fakeDispatchHarness(sessions, processed);
-				ctx.subscribeEvent((event) => {
-					events.push(event.type);
-				});
-				return ctx;
-			},
-		});
-
-		await processor.process({
-			dispatchId: 'dispatch-1',
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'case:1',
-			input: { type: 'flagged' },
-			acceptedAt: '2026-05-21T00:00:00.000Z',
-		});
-
-		expect(sessions).toEqual(['case:1']);
-		expect(processed).toHaveLength(1);
-		expect(processed[0]?.input).toEqual({ type: 'flagged' });
-		expect(events).toEqual([]);
+		]);
 	});
 
-	it('rejects dispatch metadata written by an earlier beta', async () => {
-		const input = {
-			...dispatchInput('dispatch-legacy'),
-			targetAgent: 'moderator',
-		} as DispatchInput;
-		await expect(validateAgentDispatchAdmission({ input })).rejects.toThrow(
-			'Legacy dispatch metadata is unsupported',
-		);
-		await expect(
-			createAgentDispatchProcessor({ agents: {}, createContext: createTestContext }).process(input),
-		).rejects.toThrow('Legacy dispatch metadata is unsupported');
-	});
-
-	it('admits durable dispatch processing without creating a run record', async () => {
-		const runStore = new InMemoryRunStore();
-		const input: DispatchInput = {
-			dispatchId: 'dispatch-durable',
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'case:1',
-			input: { type: 'durable' },
-			acceptedAt: '2026-05-21T00:00:00.000Z',
-		};
-
-		const receipt = await validateAgentDispatchAdmission({ input });
-		expect(receipt).toEqual({
-			dispatchId: 'dispatch-durable',
-			acceptedAt: '2026-05-21T00:00:00.000Z',
-		});
-		expect(await runStore.getRun('dispatch-durable')).toBeNull();
-	});
-
-	it('processes a durable dispatch with dispatch identity instead of run lifecycle', async () => {
-		const runStore = new InMemoryRunStore();
-		const input: DispatchInput = {
-			dispatchId: 'dispatch-process',
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'case:1',
-			input: { text: 'one' },
-			acceptedAt: '2026-05-21T00:00:00.000Z',
-		};
-		let contextRunId: string | undefined = 'unread';
-		let contextDispatchId: string | undefined;
-		const processor = createAgentDispatchProcessor({
-			agents: { moderator: createAgent(() => ({ model: false })) },
-			createContext: (id, runId, payload, request, initialEventIndex, dispatchId) => {
-				contextRunId = runId;
-				contextDispatchId = dispatchId;
-				const ctx = createTestContext(id, runId, payload, request, initialEventIndex, dispatchId);
-				ctx.initializeCreatedAgent = async () => fakeDispatchHarness([], []);
-				return ctx;
-			},
-		});
-		await processor.process(input);
-		expect(contextRunId).toBeUndefined();
-		expect(contextDispatchId).toBe('dispatch-process');
-		expect(await runStore.getRun(input.dispatchId)).toBeNull();
-		expect(await runStore.getEvents(input.dispatchId)).toEqual([]);
-	});
-
-	it('connects dispatch through the Node queue to target session processing', async () => {
-		const processed: DispatchInput[] = [];
-		const sessions: string[] = [];
-		const agent = createAgent(() => ({ model: false }));
-		const queue = new InMemoryDispatchQueue(
-			createAgentDispatchProcessor({
-				agents: { moderator: agent },
-				createContext: (...args) => {
-					const ctx = createTestContext(...args);
-					ctx.initializeCreatedAgent = async () => fakeDispatchHarness(sessions, processed);
-					return ctx;
-				},
-			}),
-		);
+	it('snapshots JSON-like input when dispatch() admits a payload', async () => {
+		const admitted: DispatchInput[] = [];
+		const payload = { type: 'flagged', report: { id: 'report:snapshot', count: 1 } };
 		configureFlueRuntime({
 			target: 'node',
-			dispatchQueue: queue,
-			resolveDispatchAgentName: (candidate) => (candidate === agent ? 'moderator' : undefined),
+			dispatchQueue: {
+				async enqueue(input) {
+					admitted.push(input);
+					return { dispatchId: input.dispatchId, acceptedAt: input.acceptedAt };
+				},
+			},
 			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
 		});
 
-		await dispatch(agent, { id: 'guild:1', input: { type: 'global' } });
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(sessions).toEqual(['default']);
-		expect(processed[0]).toMatchObject({
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'default',
-			input: { type: 'global' },
+		await dispatch({ agent: 'moderator', id: 'guild:snapshot', input: payload });
+		payload.report.count = 2;
+
+		expect(admitted[0]?.input).toEqual({
+			type: 'flagged',
+			report: { id: 'report:snapshot', count: 1 },
 		});
 	});
 
-	it('waits to process a Node dispatch until a direct prompt in the same session finishes', async () => {
-		let releaseDirect: (() => void) | undefined;
-		const directPending = new Promise<void>((resolve) => {
-			releaseDirect = resolve;
+	it('rejects missing input when dispatch() receives an undefined payload', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
 		});
-		const processed: DispatchInput[] = [];
-		const processor = createAgentDispatchProcessor({
-			agents: { moderator: createAgent(() => ({ model: false })) },
-			createContext: (...args) => {
-				const ctx = createTestContext(...args);
-				ctx.initializeCreatedAgent = async () => fakeDispatchHarness([], processed);
-				return ctx;
-			},
-		});
-		const direct = invokeDirectAttached({
-			agentName: 'moderator',
-			id: 'guild:1',
-			payload: { message: 'hold', session: 'case:1' },
-			request: new Request('http://localhost/agents/moderator/guild:1', { method: 'POST' }),
-			createContext: createTestContext,
-			handler: async () => {
-				await directPending;
-				return null;
-			},
-		});
-		const processing = processor.process(dispatchInput('dispatch-after-direct'));
 
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(processed).toEqual([]);
-		releaseDirect?.();
-		await Promise.all([direct, processing]);
-		expect(processed.map((input) => input.dispatchId)).toEqual(['dispatch-after-direct']);
+		await expect(
+			dispatch({ agent: 'moderator', id: 'guild:undefined-input', input: undefined }),
+		).rejects.toThrow('requires an "input" payload');
 	});
 
-	it('rejects a direct prompt while a Node dispatch owns the same session lock', async () => {
-		let markStarted: (() => void) | undefined;
-		const started = new Promise<void>((resolve) => {
-			markStarted = resolve;
+	it('rejects non-JSON-like input when dispatch() receives a function value', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
 		});
-		let releaseDispatch: (() => void) | undefined;
-		const dispatchPending = new Promise<void>((resolve) => {
-			releaseDispatch = resolve;
+
+		await expect(
+			dispatch({
+				agent: 'moderator',
+				id: 'guild:function-input',
+				input: { type: 'flagged', callback: () => 'unsupported' },
+			}),
+		).rejects.toThrow('must not contain function values');
+	});
+
+	it('rejects non-JSON-like input when dispatch() receives a bigint value', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({
+				agent: 'moderator',
+				id: 'guild:bigint-input',
+				input: { type: 'flagged', reportId: 1n },
+			}),
+		).rejects.toThrow('must not contain bigint values');
+	});
+
+	it('rejects non-JSON-like input when dispatch() receives a non-plain object', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({
+				agent: 'moderator',
+				id: 'guild:date-input',
+				input: { type: 'flagged', acceptedAt: new Date('2026-06-01T00:00:00.000Z') },
+			}),
+		).rejects.toThrow('must contain only plain JSON objects');
+	});
+
+	it('rejects an unknown agent when dispatch() targets an unregistered name', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({ agent: 'missing', id: 'guild:unknown-agent', input: { type: 'flagged' } }),
+		).rejects.toThrow('target agent "missing" is not registered');
+	});
+
+	it('rejects a blank agent instance id when dispatch() receives an id', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({ agent: 'moderator', id: '  ', input: { type: 'flagged' } }),
+		).rejects.toThrow('requires a non-empty "id" target agent instance id');
+	});
+
+	it('rejects a blank session name when dispatch() receives a session', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			dispatchQueue: new InMemoryDispatchQueue(),
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({ agent: 'moderator', id: 'guild:blank-session', session: '  ', input: null }),
+		).rejects.toThrow('requires a non-empty "session" target session id');
+	});
+
+	it('rejects calls when the runtime has no dispatch queue', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			manifest: { agents: [{ name: 'moderator', transports: {}, created: true }] },
+		});
+
+		await expect(
+			dispatch({ agent: 'moderator', id: 'guild:no-queue', input: { type: 'flagged' } }),
+		).rejects.toThrow('no dispatch queue is configured');
+	});
+});
+
+describe('dispatched session processing', () => {
+	it('preserves admission order when the default Node queue processes multiple inputs for one agent instance session', async () => {
+		let releaseFirst: (() => void) | undefined;
+		const firstPending = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const processingOrder: string[] = [];
+		const queue = new InMemoryDispatchQueue({
+			async process(input) {
+				processingOrder.push(input.dispatchId);
+				if (input.dispatchId === 'dispatch:queue:first') await firstPending;
+			},
+		});
+
+		try {
+			await queue.enqueue({
+				dispatchId: 'dispatch:queue:first',
+				agent: 'moderator',
+				id: 'guild:queue',
+				session: 'case:queue',
+				input: { type: 'flagged', reportId: 'report:queue:first' },
+				acceptedAt: '2026-06-01T00:00:00.000Z',
+			});
+			await queue.enqueue({
+				dispatchId: 'dispatch:queue:second',
+				agent: 'moderator',
+				id: 'guild:queue',
+				session: 'case:queue',
+				input: { type: 'flagged', reportId: 'report:queue:second' },
+				acceptedAt: '2026-06-01T00:00:01.000Z',
+			});
+			await vi.waitFor(() => {
+				expect(processingOrder).toEqual(['dispatch:queue:first']);
+			});
+		} finally {
+			releaseFirst?.();
+		}
+
+		await vi.waitFor(() => {
+			expect(processingOrder).toEqual(['dispatch:queue:first', 'dispatch:queue:second']);
+		});
+	});
+
+	it('exposes instanceId and dispatchId without runId when observe() receives dispatched agent activity', async () => {
+		const events: unknown[] = [];
+		const stopObserving = observe((event, ctx) => {
+			if (ctx.id === 'guild:observe-dispatch') events.push(event);
 		});
 		const processor = createAgentDispatchProcessor({
 			agents: { moderator: createAgent(() => ({ model: false })) },
 			createContext: (...args) => {
 				const ctx = createTestContext(...args);
 				ctx.initializeCreatedAgent = async () =>
-					blockingDispatchHarness(() => markStarted?.(), dispatchPending);
+					({
+						name: 'default',
+						session: async (name?: string) =>
+							({
+								name: name ?? 'default',
+								processDispatchInput: async () => {
+									ctx.emitEvent({ type: 'idle' });
+								},
+							}) as unknown as FlueSession & { processDispatchInput(input: DispatchInput): Promise<void> },
+						sessions: {} as never,
+						shell: (() => Promise.resolve({ stdout: '', stderr: '', exitCode: 0 })) as never,
+						fs: {} as never,
+					}) satisfies FlueHarness;
 				return ctx;
 			},
 		});
-		const processing = processor.process(dispatchInput('dispatch-first'));
-		await started;
 
-		await expect(
-			invokeDirectAttached({
-				agentName: 'moderator',
-				id: 'guild:1',
-				payload: { message: 'conflict', session: 'case:1' },
-				request: new Request('http://localhost/agents/moderator/guild:1', { method: 'POST' }),
-				createContext: createTestContext,
-				handler: async () => null,
-			}),
-		).rejects.toMatchObject({ details: 'This agent session already has an active prompt.' });
-		releaseDispatch?.();
-		await processing;
+		try {
+			await processor.process({
+				dispatchId: 'dispatch:observe',
+				agent: 'moderator',
+				id: 'guild:observe-dispatch',
+				session: 'case:observe-dispatch',
+				input: { type: 'flagged', reportId: 'report:observe-dispatch' },
+				acceptedAt: '2026-06-01T00:00:00.000Z',
+			});
+
+			expect(events).toEqual([
+				{
+					type: 'idle',
+					instanceId: 'guild:observe-dispatch',
+					dispatchId: 'dispatch:observe',
+					eventIndex: 0,
+					timestamp: expect.any(String),
+				},
+			]);
+			expect(events[0]).not.toHaveProperty('runId');
+		} finally {
+			stopObserving();
+		}
 	});
 
-	it('persists dispatched input once and reuses it during recovery', async () => {
+	it('avoids creating workflow run history when a dispatched input is processed', async () => {
+		const contextRunIds: Array<string | undefined> = [];
+		const contextDispatchIds: Array<string | undefined> = [];
+		const processor = createAgentDispatchProcessor({
+			agents: { moderator: createAgent(() => ({ model: false })) },
+			createContext: (...args) => {
+				contextRunIds.push(args[1]);
+				contextDispatchIds.push(args[5]);
+				const ctx = createTestContext(...args);
+				ctx.initializeCreatedAgent = async () =>
+					({
+						name: 'default',
+						session: async (name?: string) =>
+							({
+								name: name ?? 'default',
+								processDispatchInput: async () => {},
+							}) as unknown as FlueSession & { processDispatchInput(input: DispatchInput): Promise<void> },
+						sessions: {} as never,
+						shell: (() => Promise.resolve({ stdout: '', stderr: '', exitCode: 0 })) as never,
+						fs: {} as never,
+					}) satisfies FlueHarness;
+				return ctx;
+			},
+		});
+
+		await processor.process({
+			dispatchId: 'dispatch:no-run-history',
+			agent: 'moderator',
+			id: 'guild:no-run-history',
+			session: 'case:no-run-history',
+			input: { type: 'flagged', reportId: 'report:no-run-history' },
+			acceptedAt: '2026-06-01T00:00:00.000Z',
+		});
+
+		expect(contextRunIds).toEqual([undefined]);
+		expect(contextDispatchIds).toEqual(['dispatch:no-run-history']);
+	});
+
+	// TODO(RUNTIME-27): Migrate these retry tests to a stable generated-runtime boundary.
+	it('avoids repeating model processing when the same dispatch id is retried before the session advances', async () => {
 		const store = new InMemorySessionStore();
-		const harness = new Harness('guild:1', 'default', testAgentConfig(), fakeEnv(), store);
-		const session = await harness.session('case:1');
+		const harness = new Harness('guild:retry-idempotent', 'default', testAgentConfig(), createNoopSessionEnv({ cwd: '/' }), store);
+		const session = await harness.session('case:retry-idempotent');
 		const agent = Reflect.get(session, 'harness') as {
 			state: { messages: AgentMessage[] };
 			continue: () => Promise<void>;
 			waitForIdle: () => Promise<void>;
 		};
-		let continuations = 0;
+		let modelProcessingCount = 0;
 		agent.continue = async () => {
-			continuations += 1;
-			agent.state.messages.push(assistantMessage());
+			modelProcessingCount += 1;
+			agent.state.messages.push(assistantMessage('processed idempotently'));
 		};
 		agent.waitForIdle = async () => {};
-		const input: DispatchInput = {
-			dispatchId: 'dispatch-persisted',
-			agent: 'moderator',
-			id: 'guild:1',
-			session: 'case:1',
-			input: { type: 'flagged' },
-			acceptedAt: '2026-05-21T00:00:00.000Z',
-		};
-		const dispatched = session as FlueSession & {
+		const dispatchedSession = session as FlueSession & {
 			processDispatchInput(input: DispatchInput): PromiseLike<unknown>;
 		};
+		const input: DispatchInput = {
+			dispatchId: 'dispatch:retry-idempotent',
+			agent: 'moderator',
+			id: 'guild:retry-idempotent',
+			session: 'case:retry-idempotent',
+			input: { type: 'flagged', reportId: 'report:retry-idempotent' },
+			acceptedAt: '2026-06-01T00:00:00.000Z',
+		};
 
-		await dispatched.processDispatchInput(input);
-		await dispatched.processDispatchInput(input);
-		const data = await store.load('agent-session:["guild:1","default","case:1"]');
-		expect(continuations).toBe(1);
+		await dispatchedSession.processDispatchInput(input);
+		await dispatchedSession.processDispatchInput(input);
+
+		const data = await store.load('agent-session:["guild:retry-idempotent","default","case:retry-idempotent"]');
+		expect(modelProcessingCount).toBe(1);
 		expect(
 			data?.entries.filter((entry) => entry.type === 'message' && entry.message.role === 'user'),
 		).toHaveLength(1);
 		expect(data?.entries[0]).toMatchObject({
 			source: 'dispatch',
-			dispatch: { dispatchId: 'dispatch-persisted' },
+			dispatch: { dispatchId: 'dispatch:retry-idempotent' },
 		});
 	});
 
-	it('renders dispatched input deterministically and preserves structured metadata', async () => {
+	it('rejects a retried dispatch when later user input has already advanced the session', async () => {
 		const store = new InMemorySessionStore();
-		const harness = new Harness('guild:1', 'default', testAgentConfig(), fakeEnv(), store);
-		const session = await harness.session('case:1');
+		const harness = new Harness('guild:retry-advanced', 'default', testAgentConfig(), createNoopSessionEnv({ cwd: '/' }), store);
+		const session = await harness.session('case:retry-advanced');
 		const agent = Reflect.get(session, 'harness') as {
 			state: { messages: AgentMessage[] };
 			continue: () => Promise<void>;
 			waitForIdle: () => Promise<void>;
 		};
 		agent.continue = async () => {
-			agent.state.messages.push(assistantMessage());
+			agent.state.messages.push(assistantMessage('processed before advancement'));
 		};
 		agent.waitForIdle = async () => {};
-		await (
-			session as FlueSession & { processDispatchInput(input: DispatchInput): PromiseLike<unknown> }
-		).processDispatchInput({
-			dispatchId: 'dispatch-1',
+		const dispatchedSession = session as FlueSession & {
+			processDispatchInput(input: DispatchInput): PromiseLike<unknown>;
+		};
+		const input: DispatchInput = {
+			dispatchId: 'dispatch:retry-advanced',
 			agent: 'moderator',
-			id: 'guild:1',
-			session: 'case:1',
-			input: { z: 1, a: { b: 2, a: 1 } },
-			acceptedAt: '2026-05-21T00:00:00.000Z',
+			id: 'guild:retry-advanced',
+			session: 'case:retry-advanced',
+			input: { type: 'flagged', reportId: 'report:retry-advanced' },
+			acceptedAt: '2026-06-01T00:00:00.000Z',
+		};
+
+		await dispatchedSession.processDispatchInput(input);
+		await dispatchedSession.processDispatchInput({
+			dispatchId: 'dispatch:retry-advanced:later',
+			agent: 'moderator',
+			id: 'guild:retry-advanced',
+			session: 'case:retry-advanced',
+			input: { type: 'flagged', reportId: 'report:retry-advanced:later' },
+			acceptedAt: '2026-06-01T00:00:01.000Z',
 		});
 
-		const data = await store.load('agent-session:["guild:1","default","case:1"]');
-		const entry = data?.entries.find(
-			(item): item is Extract<typeof item, { type: 'message' }> =>
-				item.type === 'message' && item.message.role === 'user',
+		await expect(dispatchedSession.processDispatchInput(input)).rejects.toThrow(
+			'Cannot recover dispatched input after the session has advanced',
 		);
-		expect(entry).toMatchObject({
-			type: 'message',
-			source: 'dispatch',
-			dispatch: {
-				dispatchId: 'dispatch-1',
-				agent: 'moderator',
-				id: 'guild:1',
-				session: 'case:1',
-				acceptedAt: '2026-05-21T00:00:00.000Z',
-				input: { z: 1, a: { b: 2, a: 1 } },
-			},
-		});
-		expect(entry?.dispatch).not.toHaveProperty('targetAgent');
-		const text = ((entry as any)?.message.content[0]?.text ?? '') as string;
-		expect(text).toContain('[Dispatch Input]');
-		expect(text).not.toContain('targetAgent:');
-		expect(text).toContain('dispatchId: dispatch-1');
-		expect(text).toContain('input:\n{\n  "a": {\n    "a": 1,\n    "b": 2\n  },\n  "z": 1\n}');
 	});
 });
-
-function dispatchInput(dispatchId: string): DispatchInput {
-	return {
-		dispatchId,
-		agent: 'moderator',
-		id: 'guild:1',
-		session: 'case:1',
-		input: { type: 'flagged' },
-		acceptedAt: '2026-05-21T00:00:00.000Z',
-	};
-}
-
-function assistantMessage(): AgentMessage {
-	return {
-		role: 'assistant',
-		content: [{ type: 'text', text: 'processed' }],
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		timestamp: Date.now(),
-	} as AgentMessage;
-}
-
-function blockingDispatchHarness(onStart: () => void, pending: Promise<void>): FlueHarness {
-	return {
-		name: 'default',
-		session: async (name?: string) =>
-			({
-				name: name ?? 'default',
-				processDispatchInput: async () => {
-					onStart();
-					await pending;
-				},
-			}) as unknown as FlueSession & { processDispatchInput(input: DispatchInput): Promise<void> },
-		sessions: {} as never,
-		shell: (() => Promise.resolve({ stdout: '', stderr: '', exitCode: 0 })) as never,
-		fs: {} as never,
-	};
-}
-
-function fakeDispatchHarness(sessions: string[], processed: DispatchInput[]): FlueHarness {
-	return {
-		name: 'default',
-		session: async (name?: string) => {
-			const sessionName = name ?? 'default';
-			sessions.push(sessionName);
-			return {
-				name: sessionName,
-				processDispatchInput: async (input: DispatchInput) => {
-					processed.push(input);
-				},
-			} as FlueSession & { processDispatchInput(input: DispatchInput): Promise<void> };
-		},
-		sessions: {} as never,
-		shell: (() => Promise.resolve({ stdout: '', stderr: '', exitCode: 0 })) as never,
-		fs: {} as never,
-	};
-}
 
 function createTestContext(
 	id: string,
@@ -500,7 +505,7 @@ function createTestContext(
 		req,
 		initialEventIndex,
 		agentConfig: testAgentConfig(),
-		createDefaultEnv: async () => fakeEnv(),
+		createDefaultEnv: async () => createNoopSessionEnv({ cwd: '/' }),
 		defaultStore: new InMemorySessionStore(),
 	});
 }
@@ -515,24 +520,18 @@ function testAgentConfig(): AgentConfig {
 	};
 }
 
-function fakeEnv(): SessionEnv {
+function assistantMessage(text: string): AgentMessage {
 	return {
-		exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-		readFile: async () => '',
-		readFileBuffer: async () => new Uint8Array(),
-		writeFile: async () => {},
-		stat: async () => ({
-			isFile: true,
-			isDirectory: false,
-			isSymbolicLink: false,
-			size: 0,
-			mtime: new Date(),
-		}),
-		readdir: async () => [],
-		exists: async () => false,
-		mkdir: async () => {},
-		rm: async () => {},
-		cwd: '/',
-		resolvePath: (path) => path,
-	};
+		role: 'assistant',
+		content: [{ type: 'text', text }],
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		timestamp: Date.now(),
+	} as AgentMessage;
 }

@@ -376,7 +376,6 @@ Runs a model operation with a text instruction.
 | `thinkingLevel` | `ThinkingLevel`    | Reasoning-effort override for this operation.                         |
 | `signal`        | `AbortSignal`      | Cancel this operation.                                                |
 | `images`        | `PromptImage[]`    | Images attached to the user message. Requires a vision-capable model. |
-| `schema`        | Valibot schema     | Deprecated alias for `result`.                                        |
 
 #### `PromptImage`
 
@@ -425,7 +424,7 @@ interface PromptResultResponse<T> {
 }
 ```
 
-Use `result` and `response.data` in new code. The `schema` option and former `response.result` field are deprecated compatibility names. A structured-result operation throws `ResultUnavailableError` when the agent cannot produce validated data.
+A structured-result operation throws `ResultUnavailableError` when the agent cannot produce validated data.
 
 ### `session.skill(...)`
 
@@ -459,7 +458,6 @@ Opaque imported packaged-skill reference accepted by `session.skill()`. Import a
 | `thinkingLevel` | `ThinkingLevel`           | Reasoning-effort override for this operation.                                 |
 | `signal`        | `AbortSignal`             | Cancel this operation.                                                        |
 | `images`        | `PromptImage[]`           | Images attached to the skill's user message. Requires a vision-capable model. |
-| `schema`        | Valibot schema            | Deprecated alias for `result`.                                                |
 
 ### `session.task(...)`
 
@@ -481,7 +479,6 @@ Delegates work to a detached child session. Pass `options.agent` to select a nam
 | `cwd`           | `string`           | Working directory for the detached task session. Defaults to the parent session cwd. |
 | `signal`        | `AbortSignal`      | Cancel this task.                                                                    |
 | `images`        | `PromptImage[]`    | Images attached to the task's initial user message. Requires a vision-capable model. |
-| `schema`        | Valibot schema     | Deprecated alias for `result`.                                                       |
 
 ### `session.shell(...)`
 

@@ -1,419 +1,495 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { createFlueContext } from '../src/client.ts';
 import {
+	type CloudflareWebSocketAttachment,
 	type CloudflareWebSocketConnection,
 	connectCloudflareAgentWebSocket,
 	connectCloudflareWorkflowWebSocket,
 	messageCloudflareAgentWebSocket,
 	messageCloudflareWorkflowWebSocket,
 } from '../src/cloudflare/websocket.ts';
-import {
-	createFlueContext,
-	InMemoryRunRegistry,
-	InMemoryRunStore,
-	InMemorySessionStore,
-	type RunRecord,
-	type RunStore,
-} from '../src/internal.ts';
-import type { FlueEvent, WebSocketServerMessage } from '../src/types.ts';
+import { InMemoryRunStore } from '../src/node/run-store.ts';
+import { InMemorySessionStore } from '../src/session.ts';
+import type { WebSocketServerMessage } from '../src/types.ts';
 
-describe('Cloudflare WebSocket transport', () => {
-	it('keeps agent sockets open across sequential prompts', async () => {
+describe('Cloudflare agent WebSockets', () => {
+	it('persists agent routing identity when a Cloudflare agent socket connects', () => {
 		const connection = new TestConnection();
+
 		connectCloudflareAgentWebSocket(connection, {
 			name: 'assistant',
-			id: 'instance-1',
-			requestUrl: 'https://example.com/agents/assistant/instance-1',
+			id: 'agent-instance-1',
+			requestUrl: 'https://example.com/flue/agents/assistant/agent-instance-1?token=secret',
 		});
-		const options = agentOptions();
 
-		await messageCloudflareAgentWebSocket(
-			connection,
-			JSON.stringify({
-				version: 1,
-				type: 'prompt',
-				requestId: 'one',
-				message: 'first',
-				session: 'chat',
-			}),
-			options,
-		);
-		await messageCloudflareAgentWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'prompt', requestId: 'two', message: 'second' }),
-			options,
-		);
-
-		expect(connection.messages[0]).toMatchObject({
-			type: 'ready',
+		expect(connection.attachment).toEqual({
+			version: 1,
 			target: 'agent',
 			name: 'assistant',
-			instanceId: 'instance-1',
+			id: 'agent-instance-1',
+			requestUrl: 'https://example.com/flue/agents/assistant/agent-instance-1?token=secret',
 		});
-		const first = connection.messages.find(
-			(message) => message.type === 'result' && message.requestId === 'one',
-		);
-		const second = connection.messages.find(
-			(message) => message.type === 'result' && message.requestId === 'two',
-		);
-		expect(first).toMatchObject({ result: { message: 'first', session: 'chat' } });
-		expect(first).not.toHaveProperty('runId');
-		expect(second).toMatchObject({ result: { message: 'second' } });
-		expect(second).not.toHaveProperty('runId');
-		expect(connection.closed).toBeUndefined();
 	});
 
-	it('returns structured invalid-message errors without closing agent sockets', async () => {
+	it('sends an agent ready frame when a Cloudflare agent socket connects', () => {
 		const connection = new TestConnection();
-		await messageCloudflareAgentWebSocket(connection, '{', agentOptions());
 
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({
-				type: 'error',
-				error: expect.objectContaining({ type: 'invalid_request' }),
-			}),
-		);
-		expect(connection.closed).toBeUndefined();
-	});
-
-	it('rejects Agents SDK reserved inbound messages as invalid Flue protocol messages', async () => {
-		const connection = new TestConnection();
-		await messageCloudflareAgentWebSocket(
-			connection,
-			JSON.stringify({ type: 'cf_agent_state', state: { tampered: true } }),
-			agentOptions(),
-		);
-
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({
-				type: 'error',
-				error: expect.objectContaining({ type: 'invalid_request' }),
-			}),
-		);
-	});
-
-	it('closes sockets before invoking oversized messages', async () => {
-		const connection = new TestConnection();
-		await messageCloudflareAgentWebSocket(
-			connection,
-			JSON.stringify({
-				version: 1,
-				type: 'prompt',
-				requestId: 'large',
-				message: 'x'.repeat(1024 * 1024),
-			}),
-			agentOptions(),
-		);
-
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({
-				type: 'error',
-				error: expect.objectContaining({ type: 'invalid_request' }),
-			}),
-		);
-		expect(connection.closed).toEqual({ code: 1008, reason: 'Message too large' });
-	});
-
-	it('does not fail an invocation when a disconnected socket rejects delivery', async () => {
-		const connection = new TestConnection();
-		connection.rejectSends = true;
-		await messageCloudflareAgentWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'prompt', requestId: 'gone', message: 'continue' }),
-			agentOptions(),
-		);
-		expect(connection.closed).toBeUndefined();
-	});
-
-	it('runs one workflow invocation through durable admission and closes normally after its result', async () => {
-		const connection = new TestConnection();
-		let admissions = 0;
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:test',
-			requestUrl: 'https://example.com/workflows/job',
+		connectCloudflareAgentWebSocket(connection, {
+			name: 'assistant',
+			id: 'agent-instance-1',
+			requestUrl: 'https://example.com/flue/agents/assistant/agent-instance-1',
 		});
-		await messageCloudflareWorkflowWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-1', payload: { ok: true } }),
+
+		expect(connection.messages).toEqual([
 			{
-				name: 'job',
-				runId: 'workflow:job:test',
-				request: new Request('https://example.com/workflows/job'),
-				handler: async (ctx) => {
-					ctx.log.info('working');
-					return ctx.payload;
-				},
+				version: 1,
+				type: 'ready',
+				target: 'agent',
+				name: 'assistant',
+				instanceId: 'agent-instance-1',
+			},
+		]);
+	});
+
+	it('replies with pong when a Cloudflare agent socket receives ping', async () => {
+		const connection = new TestConnection();
+
+		await messageCloudflareAgentWebSocket(
+			connection,
+			JSON.stringify({ version: 1, type: 'ping', requestId: 'ping-1' }),
+			{
+				name: 'assistant',
+				id: 'agent-instance-1',
+				request: new Request('https://example.com/flue/agents/assistant/agent-instance-1'),
+				handler: async () => null,
 				createContext,
-				startWorkflowAdmission: async (runId, run) => {
-					admissions++;
-					expect(runId).toBe('workflow:job:test');
-					return run();
-				},
-				runStore: new InMemoryRunStore(),
-				runRegistry: new InMemoryRunRegistry(),
 			},
 		);
 
-		expect(admissions).toBe(1);
-		expect(connection.messages[0]).toMatchObject({
-			type: 'ready',
-			target: 'workflow',
-			name: 'job',
-		});
-		expect(connection.messages[1]).toMatchObject({
-			type: 'started',
-			requestId: 'work-1',
-			runId: 'workflow:job:test',
-		});
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({
-				type: 'event',
-				requestId: 'work-1',
-				runId: 'workflow:job:test',
-				event: expect.objectContaining({ type: 'run_start' }),
-			}),
-		);
-		expect(connection.messages.findIndex((message) => message.type === 'started')).toBeLessThan(
-			connection.messages.findIndex((message) => message.type === 'event'),
-		);
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({ type: 'result', requestId: 'work-1', result: { ok: true } }),
-		);
-		expect(connection.closed).toEqual({ code: 1000, reason: 'Workflow completed' });
+		expect(connection.messages).toEqual([{ version: 1, type: 'pong', requestId: 'ping-1' }]);
+		expect(connection.closed).toBeUndefined();
 	});
 
-	it('does not send started when durable execution scheduling fails', async () => {
+	it('restores the requested session before invoking a prompt when a Cloudflare agent socket receives a message', async () => {
 		const connection = new TestConnection();
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:admission-error',
-			requestUrl: 'https://example.com/workflows/job',
+		const calls: string[] = [];
+
+		await messageCloudflareAgentWebSocket(
+			connection,
+			JSON.stringify({
+				version: 1,
+				type: 'prompt',
+				requestId: 'prompt-1',
+				message: 'Hello',
+				session: 'support',
+			}),
+			{
+				name: 'assistant',
+				id: 'agent-instance-1',
+				request: new Request('https://example.com/flue/agents/assistant/agent-instance-1'),
+				beforePrompt: async (session) => {
+					calls.push(`restore:${session}`);
+				},
+				handler: async (ctx) => {
+					calls.push('invoke');
+					return ctx.payload;
+				},
+				createContext,
+			},
+		);
+
+		expect(calls).toEqual(['restore:support', 'invoke']);
+		expect(connection.messages).toContainEqual({
+			version: 1,
+			type: 'result',
+			requestId: 'prompt-1',
+			result: { message: 'Hello', session: 'support' },
 		});
+		expect(connection.closed).toBeUndefined();
+	});
+
+	it.todo('includes the prompt request id when restoring the requested session fails');
+
+	it('rejects oversized messages when a Cloudflare agent socket exceeds the byte limit', async () => {
+		const connection = new TestConnection();
+		let invocations = 0;
+
+		await messageCloudflareAgentWebSocket(
+			connection,
+			JSON.stringify({
+				version: 1,
+				type: 'prompt',
+				requestId: 'prompt-large',
+				message: 'x'.repeat(1024 * 1024),
+			}),
+			{
+				name: 'assistant',
+				id: 'agent-instance-1',
+				request: new Request('https://example.com/flue/agents/assistant/agent-instance-1'),
+				handler: async () => {
+					invocations++;
+					return null;
+				},
+				createContext,
+			},
+		);
+
+		expect(connection.messages).toEqual([
+			{
+				version: 1,
+				type: 'error',
+				error: {
+					type: 'invalid_request',
+					message: 'Request is malformed.',
+					details: 'WebSocket messages must not exceed 1048576 bytes.',
+				},
+			},
+		]);
+		expect(connection.closed).toEqual({ code: 1008, reason: 'Message too large' });
+		expect(invocations).toBe(0);
+	});
+
+	it('rejects binary messages when a Cloudflare agent socket receives non-text input', async () => {
+		const connection = new TestConnection();
+		let invocations = 0;
+
+		await messageCloudflareAgentWebSocket(connection, new Uint8Array([1, 2, 3]), {
+			name: 'assistant',
+			id: 'agent-instance-1',
+			request: new Request('https://example.com/flue/agents/assistant/agent-instance-1'),
+			handler: async () => {
+				invocations++;
+				return null;
+			},
+			createContext,
+		});
+
+		expect(connection.messages).toEqual([
+			{
+				version: 1,
+				type: 'error',
+				error: {
+					type: 'invalid_request',
+					message: 'Request is malformed.',
+					details: 'Binary WebSocket messages are not supported.',
+				},
+			},
+		]);
+		expect(connection.closed).toEqual({ code: 1003, reason: 'Binary messages are not supported' });
+		expect(invocations).toBe(0);
+	});
+
+	it('includes the prompt request id when an attached agent invocation fails', async () => {
+		const connection = new TestConnection();
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+		try {
+			await messageCloudflareAgentWebSocket(
+				connection,
+				JSON.stringify({
+					version: 1,
+					type: 'prompt',
+					requestId: 'prompt-failure',
+					message: 'Hello',
+				}),
+				{
+					name: 'assistant',
+					id: 'agent-instance-1',
+					request: new Request('https://example.com/flue/agents/assistant/agent-instance-1'),
+					handler: async () => {
+						throw new Error('database password leaked');
+					},
+					createContext,
+				},
+			);
+		} finally {
+			consoleError.mockRestore();
+		}
+
+		expect(connection.messages).toContainEqual({
+			version: 1,
+			type: 'error',
+			requestId: 'prompt-failure',
+			error: {
+				type: 'internal_error',
+				message: 'An internal error occurred.',
+				details: 'The server encountered an unexpected error while handling this request.',
+			},
+		});
+		expect(connection.closed).toBeUndefined();
+	});
+});
+
+describe('Cloudflare workflow WebSockets', () => {
+	it('accepts the first workflow invocation when a restored socket has not previously invoked', async () => {
+		const connection = new TestConnection();
+		connection.attachment = {
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: false,
+		};
+		let admissions = 0;
+		let payload: unknown;
+
 		await messageCloudflareWorkflowWebSocket(
 			connection,
 			JSON.stringify({
 				version: 1,
 				type: 'invoke',
-				requestId: 'work-admission-error',
-				payload: {},
+				requestId: 'workflow-request-1',
+				payload: { topic: 'support' },
 			}),
 			{
-				name: 'job',
-				runId: 'workflow:job:admission-error',
-				request: new Request('https://example.com/workflows/job'),
-				handler: async () => null,
-				createContext,
-				startWorkflowAdmission: async () => {
-					throw new Error('no fiber');
-				},
-				runStore: new InMemoryRunStore(),
-				runRegistry: new InMemoryRunRegistry(),
-			},
-		);
-
-		expect(connection.messages.some((message) => message.type === 'started')).toBe(false);
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({
-				type: 'error',
-				requestId: 'work-admission-error',
-				runId: 'workflow:job:admission-error',
-			}),
-		);
-		expect(connection.closed).toEqual({ code: 1011, reason: 'Workflow failed' });
-	});
-
-	it('normalizes an omitted workflow payload for recoverable admission', async () => {
-		const connection = new TestConnection();
-		const runStore = new InMemoryRunStore();
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:empty',
-			requestUrl: 'https://example.com/workflows/job',
-		});
-		await messageCloudflareWorkflowWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-empty' }),
-			{
-				name: 'job',
-				runId: 'workflow:job:empty',
-				request: new Request('https://example.com/workflows/job'),
-				handler: async (ctx) => ctx.payload,
-				createContext,
-				startWorkflowAdmission: async (_runId, run) => run(),
-				runStore,
-				runRegistry: new InMemoryRunRegistry(),
-			},
-		);
-
-		expect(await runStore.getRun('workflow:job:empty')).toMatchObject({ payload: {}, result: {} });
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({ type: 'result', result: {} }),
-		);
-	});
-
-	it('preserves an explicit null workflow payload', async () => {
-		const connection = new TestConnection();
-		const runStore = new InMemoryRunStore();
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:null',
-			requestUrl: 'https://example.com/workflows/job',
-		});
-		await messageCloudflareWorkflowWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-null', payload: null }),
-			{
-				name: 'job',
-				runId: 'workflow:job:null',
-				request: new Request('https://example.com/workflows/job'),
-				handler: async (ctx) => ctx.payload,
-				createContext,
-				startWorkflowAdmission: async (_runId, run) => run(),
-				runStore,
-				runRegistry: new InMemoryRunRegistry(),
-			},
-		);
-
-		expect(await runStore.getRun('workflow:job:null')).toMatchObject({
-			payload: null,
-			result: null,
-		});
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({ type: 'result', result: null }),
-		);
-	});
-
-	it('does not send started or execute a workflow when durable admission persistence fails', async () => {
-		const connection = new TestConnection();
-		let admissions = 0;
-		let executions = 0;
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:failed',
-			requestUrl: 'https://example.com/workflows/job',
-		});
-		await messageCloudflareWorkflowWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-2', payload: { ok: true } }),
-			{
-				name: 'job',
-				runId: 'workflow:job:failed',
-				request: new Request('https://example.com/workflows/job'),
-				handler: async () => {
-					executions++;
-					return null;
+				name: 'summarize',
+				runId: 'workflow:summarize:run-1',
+				request: new Request('https://example.com/flue/workflows/summarize'),
+				handler: async (ctx) => {
+					payload = ctx.payload;
+					return 'done';
 				},
 				createContext,
-				startWorkflowAdmission: async (_runId, run) => {
+				startWorkflowAdmission: async (runId, run) => {
+					expect(runId).toBe('workflow:summarize:run-1');
 					admissions++;
 					return run();
 				},
-				runStore: new FailingRunStore(),
-				runRegistry: new InMemoryRunRegistry(),
+				runStore: new InMemoryRunStore(),
 			},
 		);
 
-		expect(admissions).toBe(0);
-		expect(executions).toBe(0);
-		expect(connection.messages.some((message) => message.type === 'started')).toBe(false);
-		expect(connection.messages).toContainEqual(
-			expect.objectContaining({ type: 'error', requestId: 'work-2', runId: 'workflow:job:failed' }),
-		);
-		expect(connection.closed).toEqual({ code: 1011, reason: 'Workflow failed' });
+		expect(connection.attachment).toEqual({
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: true,
+		});
+		expect(admissions).toBe(1);
+		expect(payload).toEqual({ topic: 'support' });
+		expect(connection.messages).toContainEqual({
+			version: 1,
+			type: 'started',
+			requestId: 'workflow-request-1',
+			runId: 'workflow:summarize:run-1',
+		});
 	});
 
-	it('accepts one workflow invocation only', async () => {
+	it('rejects a second invocation when restored workflow socket state is already invoked', async () => {
 		const connection = new TestConnection();
-		let executions = 0;
-		let release: (() => void) | undefined;
-		connectCloudflareWorkflowWebSocket(connection, {
-			name: 'job',
-			runId: 'workflow:job:single',
-			requestUrl: 'https://example.com/workflows/job',
-		});
-		const options = {
-			name: 'job',
-			runId: 'workflow:job:single',
-			request: new Request('https://example.com/workflows/job'),
-			handler: async () => {
-				executions++;
-				await new Promise<void>((resolve) => {
-					release = resolve;
-				});
-				return null;
-			},
-			createContext,
-			startWorkflowAdmission: async (_runId: string, run: () => Promise<unknown>) => run(),
-			runStore: new InMemoryRunStore(),
-			runRegistry: new InMemoryRunRegistry(),
+		connection.attachment = {
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: true,
 		};
-		const first = messageCloudflareWorkflowWebSocket(
-			connection,
-			JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-one' }),
-			options,
-		);
-		await waitFor(() => release !== undefined);
+		let invocations = 0;
 
+		await messageCloudflareWorkflowWebSocket(
+			connection,
+			JSON.stringify({
+				version: 1,
+				type: 'invoke',
+				requestId: 'workflow-request-2',
+				payload: null,
+			}),
+			{
+				name: 'summarize',
+				runId: 'workflow:summarize:run-1',
+				request: new Request('https://example.com/flue/workflows/summarize'),
+				handler: async () => {
+					invocations++;
+					return null;
+				},
+				createContext,
+				startWorkflowAdmission: async (_runId, run) => run(),
+				runStore: new InMemoryRunStore(),
+			},
+		);
+
+		expect(connection.messages).toEqual([
+			{
+				version: 1,
+				type: 'error',
+				requestId: 'workflow-request-2',
+				error: {
+					type: 'invalid_request',
+					message: 'Request is malformed.',
+					details: 'Workflow WebSocket connections accept one invocation only.',
+				},
+			},
+		]);
+		expect(connection.closed).toEqual({
+			code: 1008,
+			reason: 'Workflow accepts one invocation only',
+		});
+		expect(invocations).toBe(0);
+	});
+
+	it('rejects oversized messages when a Cloudflare workflow socket exceeds the byte limit', async () => {
+		const connection = new TestConnection();
+		connection.attachment = {
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: false,
+		};
+		let invocations = 0;
+
+		await messageCloudflareWorkflowWebSocket(
+			connection,
+			JSON.stringify({
+				version: 1,
+				type: 'invoke',
+				requestId: 'workflow-request-large',
+				payload: 'x'.repeat(1024 * 1024),
+			}),
+			{
+				name: 'summarize',
+				runId: 'workflow:summarize:run-1',
+				request: new Request('https://example.com/flue/workflows/summarize'),
+				handler: async () => {
+					invocations++;
+					return null;
+				},
+				createContext,
+				startWorkflowAdmission: async (_runId, run) => run(),
+				runStore: new InMemoryRunStore(),
+			},
+		);
+
+		expect(connection.messages).toEqual([
+			{
+				version: 1,
+				type: 'error',
+				error: {
+					type: 'invalid_request',
+					message: 'Request is malformed.',
+					details: 'WebSocket messages must not exceed 1048576 bytes.',
+				},
+			},
+		]);
+		expect(connection.attachment).toEqual({
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: false,
+		});
+		expect(connection.closed).toEqual({ code: 1008, reason: 'Message too large' });
+		expect(invocations).toBe(0);
+	});
+
+	it('closes successfully when a Cloudflare workflow socket delivers its result', async () => {
+		const connection = new TestConnection();
+		connectCloudflareWorkflowWebSocket(connection, {
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+		});
+
+		await messageCloudflareWorkflowWebSocket(
+			connection,
+			JSON.stringify({
+				version: 1,
+				type: 'invoke',
+				requestId: 'workflow-request-result',
+				payload: { topic: 'support' },
+			}),
+			{
+				name: 'summarize',
+				runId: 'workflow:summarize:run-1',
+				request: new Request('https://example.com/flue/workflows/summarize'),
+				handler: async () => ({ summary: 'Resolved' }),
+				createContext,
+				startWorkflowAdmission: async (_runId, run) => run(),
+				runStore: new InMemoryRunStore(),
+			},
+		);
+
+		expect(connection.messages).toContainEqual({
+			version: 1,
+			type: 'result',
+			requestId: 'workflow-request-result',
+			runId: 'workflow:summarize:run-1',
+			result: { summary: 'Resolved' },
+		});
+		expect(connection.closed).toEqual({ code: 1000, reason: 'Workflow completed' });
+	});
+
+	it('closes with failure when a Cloudflare workflow invocation throws', async () => {
+		const connection = new TestConnection();
+		connection.attachment = {
+			version: 1,
+			target: 'workflow',
+			name: 'summarize',
+			runId: 'workflow:summarize:run-1',
+			requestUrl: 'https://example.com/flue/workflows/summarize',
+			invoked: false,
+		};
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 		try {
 			await messageCloudflareWorkflowWebSocket(
 				connection,
-				JSON.stringify({ version: 1, type: 'invoke', requestId: 'work-two' }),
-				options,
-			);
-
-			expect(connection.messages).toContainEqual(
-				expect.objectContaining({
-					type: 'error',
-					requestId: 'work-two',
-					error: expect.objectContaining({ type: 'invalid_request' }),
+				JSON.stringify({
+					version: 1,
+					type: 'invoke',
+					requestId: 'workflow-request-failure',
+					payload: { topic: 'support' },
 				}),
+				{
+					name: 'summarize',
+					runId: 'workflow:summarize:run-1',
+					request: new Request('https://example.com/flue/workflows/summarize'),
+					handler: async () => {
+						throw new Error('database password leaked');
+					},
+					createContext,
+					startWorkflowAdmission: async (_runId, run) => run(),
+					runStore: new InMemoryRunStore(),
+				},
 			);
-			expect(executions).toBe(1);
-			expect(connection.closed).toEqual({
-				code: 1008,
-				reason: 'Workflow accepts one invocation only',
-			});
 		} finally {
-			release?.();
-			await first;
+			consoleError.mockRestore();
 		}
+
+		expect(connection.messages).toContainEqual({
+			version: 1,
+			type: 'error',
+			requestId: 'workflow-request-failure',
+			runId: 'workflow:summarize:run-1',
+			error: {
+				type: 'internal_error',
+				message: 'An internal error occurred.',
+				details: 'The server encountered an unexpected error while handling this request.',
+			},
+		});
+		expect(connection.closed).toEqual({ code: 1011, reason: 'Workflow failed' });
 	});
 });
 
-class FailingRunStore implements RunStore {
-	async createRun(_input: Parameters<RunStore['createRun']>[0]): Promise<void> {
-		throw new Error('create failed');
-	}
-
-	async endRun(_input: Parameters<RunStore['endRun']>[0]): Promise<void> {}
-
-	async appendEvent(_runId: string, _event: FlueEvent): Promise<void> {}
-
-	async getEvents(_runId: string, _fromIndex?: number): Promise<FlueEvent[]> {
-		return [];
-	}
-
-	async getRun(_runId: string): Promise<RunRecord | null> {
-		return null;
-	}
-}
-
 class TestConnection implements CloudflareWebSocketConnection {
-	attachment = null as ReturnType<CloudflareWebSocketConnection['deserializeAttachment']>;
+	attachment: CloudflareWebSocketAttachment | null = null;
 	messages: WebSocketServerMessage[] = [];
 	closed: { code?: number; reason?: string } | undefined;
-	rejectSends = false;
 
-	serializeAttachment(attachment: NonNullable<typeof this.attachment>): void {
+	serializeAttachment(attachment: CloudflareWebSocketAttachment): void {
 		this.attachment = attachment;
 	}
 
-	deserializeAttachment() {
+	deserializeAttachment(): CloudflareWebSocketAttachment | null {
 		return this.attachment;
 	}
 
 	send(message: string): void {
-		if (this.rejectSends) throw new Error('socket closed');
 		this.messages.push(JSON.parse(message) as WebSocketServerMessage);
 	}
 
@@ -422,33 +498,13 @@ class TestConnection implements CloudflareWebSocketConnection {
 	}
 }
 
-function agentOptions() {
-	return {
-		name: 'assistant',
-		id: 'instance-1',
-		request: new Request('https://example.com/agents/assistant/instance-1'),
-		handler: async (ctx: { payload: unknown }) => ctx.payload,
-		createContext,
-		runStore: new InMemoryRunStore(),
-		runRegistry: new InMemoryRunRegistry(),
-	};
-}
-
-async function waitFor(predicate: () => boolean): Promise<void> {
-	for (let attempt = 0; attempt < 100; attempt++) {
-		if (predicate()) return;
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	throw new Error('Expected condition was not met.');
-}
-
-function createContext(id: string, runId: string | undefined, payload: unknown, req: Request) {
+function createContext(id: string, runId: string | undefined, payload: unknown, request: Request) {
 	return createFlueContext({
 		id,
 		runId,
 		payload,
 		env: {},
-		req,
+		req: request,
 		agentConfig: { systemPrompt: '', skills: {}, model: undefined, resolveModel: () => undefined },
 		createDefaultEnv: async () => ({}) as never,
 		defaultStore: new InMemorySessionStore(),

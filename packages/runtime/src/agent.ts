@@ -8,6 +8,7 @@ const MAX_GREP_MATCHES = 100;
 const MAX_GREP_LINE_LENGTH = 500;
 const MAX_GLOB_RESULTS = 1000;
 const BASE64_READ_LINE_LENGTH = 76;
+const PACKAGED_SKILLS_ROOT = '/.flue/packaged-skills/';
 
 export interface TaskToolParams {
 	prompt: string;
@@ -84,8 +85,11 @@ function createReadTool(
 			throwIfAborted(signal);
 
 			const packagedFile = readPackagedSkillFile(packagedSkills, params.path);
-			if (packagedFile) {
+			if (packagedFile !== undefined) {
 				return formatReadContent(params.path, packagedFile, params.offset, params.limit);
+			}
+			if (params.path.startsWith(PACKAGED_SKILLS_ROOT)) {
+				throw new Error(`[flue] Packaged skill file not found: ${params.path}`);
 			}
 
 			try {

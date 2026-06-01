@@ -18,7 +18,7 @@ export function selectEnvFile(envFile: string | undefined, baseDir: string): str
 	return absolute;
 }
 
-export function parseEnvFile(file: string): Record<string, string> {
+function parseEnvFile(file: string): Record<string, string> {
 	if (!fs.existsSync(file)) return {};
 	return parseEnv(fs.readFileSync(file, 'utf-8')) as Record<string, string>;
 }

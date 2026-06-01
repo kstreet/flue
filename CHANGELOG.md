@@ -315,10 +315,10 @@ Big release! We are working hard to stabilize our APIs and add any missing and e
 
   // After
   const { text } = await session.prompt('…');
-  const { data: user } = await session.prompt('…', { schema: UserSchema });
+  const { data: user } = await session.prompt('…', { result: UserSchema });
   ```
 
-  The schema option was renamed from `result` to `schema`, and the response field from `result` to `data`. The old `result` spellings (both the option and the response field) still work at runtime for backwards compatibility, but are typed as `never` so TypeScript flags new usage. Both names will be removed in a future release.
+  Structured results use the `result` option and return validated data on `response.data`.
 
   Schema results are now extracted via injected `finish` / `give_up` model-facing tools instead of `---RESULT_START---` / `---RESULT_END---` text markers. The unused `ResultExtractionError` class is removed; a new `ResultUnavailableError` is thrown when the model invokes `give_up`.
 
