@@ -8,8 +8,10 @@
  * All functions operate on plain values — no database driver types.
  */
 
+import * as v from 'valibot';
 import type { AgentSubmission } from './agent-execution-store.ts';
 import { createSessionStorageKey } from './session-identity.ts';
+import { DirectAgentPayloadSchema } from './runtime/schemas.ts';
 
 /**
  * Agent-mode submissions (HTTP and dispatch) always target the
@@ -79,15 +81,8 @@ export function isSubmissionPayload(
 		) === ctx.sessionKey &&
 		typeof value.acceptedAt === 'string' &&
 		Date.parse(value.acceptedAt as string) === ctx.acceptedAt &&
-		isDirectPayload(value.payload)
+		v.safeParse(DirectAgentPayloadSchema, value.payload).success
 	);
-}
-
-/** Validate that a value is a well-formed direct submission payload. */
-function isDirectPayload(value: unknown): boolean {
-	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-	const payload = value as { message?: unknown };
-	return typeof payload.message === 'string';
 }
 
 // ─── Timestamp parsing ──────────────────────────────────────────────────────

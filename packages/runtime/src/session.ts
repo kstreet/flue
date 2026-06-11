@@ -2064,7 +2064,7 @@ export class Session implements FlueSession {
 			findInput: () => this.history.findDirectSubmissionInput(input.submissionId),
 			persistInput: () =>
 				this.history.appendMessage(
-					createUserContextMessage(input.payload.message, new Date().toISOString()),
+					createUserContextMessage(input.payload.message, new Date().toISOString(), input.payload.images),
 					'prompt',
 					{ directSubmissionId: input.submissionId },
 				),

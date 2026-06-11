@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFlueContext } from '../src/client.ts';
 import { InMemoryRunRegistry } from '../src/node/run-registry.ts';
 import { InMemoryRunStore } from '../src/node/run-store.ts';
+import { MAX_IMAGE_DATA_LENGTH } from '../src/persisted-images.ts';
 import { agentStreamPath } from '../src/runtime/event-stream-store.ts';
 import { configureFlueRuntime, createDefaultFlueApp, flue, resetFlueRuntimeForTests } from '../src/runtime/flue-app.ts';
 import { InMemorySessionStore } from '../src/session.ts';
@@ -31,7 +32,7 @@ describe('flue()', () => {
 		expect(response.status).toBe(200);
 		const body = (await response.json()) as {
 			info: { title: string; version: string };
-			paths: Record<string, Record<string, unknown>>;
+			paths: Record<string, Record<string, any>>;
 		};
 		expect(body.info).toMatchObject({ title: 'Flue Public API', version: '9.9.9' });
 		expect(Object.keys(body.paths)).toHaveLength(2);
@@ -41,6 +42,26 @@ describe('flue()', () => {
 		});
 		expect(Object.keys(body.paths['/workflows/{name}'] ?? {})).toEqual(['post']);
 		expect(Object.keys(body.paths['/agents/{name}/{id}'] ?? {})).toEqual(['post']);
+		const schema = body.paths['/agents/{name}/{id}']?.post?.requestBody?.content?.['application/json']?.schema;
+		expect(schema).toMatchObject({
+			type: 'object',
+			required: ['message'],
+			properties: {
+				message: { type: 'string' },
+				images: {
+					type: 'array',
+					items: {
+						type: 'object',
+						required: ['type', 'data', 'mimeType'],
+						properties: {
+							type: { const: 'image' },
+							data: { type: 'string', maxLength: MAX_IMAGE_DATA_LENGTH },
+							mimeType: { type: 'string' },
+						},
+					},
+				},
+			},
+		});
 	});
 
 	it('invokes an HTTP-exposed agent when the mounted app receives a valid agent POST', async () => {
@@ -71,6 +92,29 @@ describe('flue()', () => {
 			streamUrl: 'http://localhost/api/agents/assistant/customer-123',
 			offset: '-1',
 		});
+	});
+
+	it('accepts direct agent images and delivers them unchanged', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			manifest: { agents: [{ name: 'assistant', transports: { http: true }, created: true }] },
+			createAdmission: { assistant: () => async (payload) => payload },
+			createContext: createTestContext,
+			eventStreamStore: createTestEventStreamStore(),
+		});
+		const app = new Hono();
+		app.route('/api', flue());
+		const response = await app.fetch(new Request('http://localhost/api/agents/assistant/customer-123?wait=result', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({
+				message: 'hello',
+				images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png', ignored: true }],
+				ignored: true,
+			}),
+		}));
+		expect(response.status).toBe(200);
+		expect((await response.json()) as unknown).toMatchObject({ result: { message: 'hello', images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }] } });
 	});
 
 	it('returns the synchronous result envelope when an agent POST requests wait=result', async () => {
@@ -526,7 +570,46 @@ describe('flue()', () => {
 				type: 'invalid_request',
 				message: 'Request is malformed.',
 				details:
-					'Direct agent requests must use JSON object body { "message": string }.',
+					'Direct agent requests must use JSON object body { "message": string, "images"?: image[] }.',
+			},
+		});
+	});
+
+	it('rejects a direct agent image above the encoded length limit', async () => {
+		configureFlueRuntime({
+			target: 'node',
+			manifest: {
+				agents: [{ name: 'assistant', transports: { http: true }, created: true }],
+			},
+			createAdmission: {
+				assistant: () => async (payload) => payload,
+			},
+			createContext: createTestContext,
+			eventStreamStore: createTestEventStreamStore(),
+		});
+		const app = new Hono();
+		app.route('/api', flue());
+
+		const response = await app.fetch(
+			new Request('http://localhost/api/agents/assistant/customer-123', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({
+					message: 'hello',
+					images: [{
+						type: 'image',
+						data: 'a'.repeat(MAX_IMAGE_DATA_LENGTH + 1),
+						mimeType: 'image/png',
+					}],
+				}),
+			}),
+		);
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({
+			error: {
+				type: 'invalid_request',
+				details: `Image data exceeds the ${MAX_IMAGE_DATA_LENGTH} character limit.`,
 			},
 		});
 	});

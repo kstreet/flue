@@ -21,6 +21,7 @@ describe('createFlueClient', () => {
 
 			const options: AgentPromptOptions = {
 				message: 'Hello',
+				images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }],
 			};
 
 			await expect(client.agents.prompt('hello', 'inst-1', options)).resolves.toEqual({
@@ -29,7 +30,31 @@ describe('createFlueClient', () => {
 			expect(seen).toHaveLength(1);
 			expect(new URL(seen[0]?.url ?? '').pathname).toBe('/agents/hello/inst-1');
 			expect(seen[0]?.method).toBe('POST');
-			expect(await seen[0]?.json()).toEqual({ message: 'Hello' });
+			expect(await seen[0]?.json()).toEqual({
+				message: 'Hello',
+				images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }],
+			});
+		});
+	});
+
+	describe('agents.send()', () => {
+		it('sends images in the accepted prompt body', async () => {
+			const seen: Request[] = [];
+			const client = createFlueClient({
+				baseUrl: 'https://flue.test',
+				fetch: async (input, init) => {
+					seen.push(new Request(input, init));
+					return Response.json({ streamUrl: 'https://flue.test/stream', offset: '-1' });
+				},
+			});
+			await client.agents.send('hello', 'inst-1', {
+				message: 'Hello',
+				images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }],
+			});
+			expect(await seen[0]?.json()).toEqual({
+				message: 'Hello',
+				images: [{ type: 'image', data: 'YWJj', mimeType: 'image/png' }],
+			});
 		});
 	});
 

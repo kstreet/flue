@@ -51,6 +51,7 @@ export interface DispatchReceipt {
 
 export interface DirectAgentPayload {
 	message: string;
+	images?: PromptImage[];
 }
 
 /** Context passed to a {@link createAgent} initializer. */

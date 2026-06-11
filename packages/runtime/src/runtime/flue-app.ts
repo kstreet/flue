@@ -1,3 +1,4 @@
+import { toJsonSchema } from '@valibot/to-json-schema';
 import type { MiddlewareHandler } from 'hono';
 import { Hono } from 'hono';
 import {
@@ -42,6 +43,7 @@ import type { RunStore } from './run-store.ts';
 
 import {
 	AgentInvocationResponseSchema,
+	DirectAgentPayloadSchema,
 	AgentRouteParamSchema,
 	ErrorEnvelopeSchema,
 	WorkflowAdmissionResponseSchema,
@@ -406,13 +408,7 @@ function agentRouteSpec() {
 			required: true,
 			content: {
 				'application/json': {
-					schema: {
-						type: 'object',
-						required: ['message'],
-						properties: {
-							message: { type: 'string' },
-						},
-					},
+					schema: toJsonSchema(DirectAgentPayloadSchema, { errorMode: 'ignore' }),
 				},
 			},
 		},

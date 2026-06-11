@@ -10,6 +10,7 @@ export type {
 export { createFlueClient } from './client.ts';
 export { FlueApiError } from './http.ts';
 export type {
+	AgentPromptImage,
 	AgentPromptOptions,
 	AgentPromptResult,
 } from './public/invoke.ts';

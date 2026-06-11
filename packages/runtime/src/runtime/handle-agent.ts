@@ -1,5 +1,6 @@
 /** Shared per-agent HTTP dispatcher for the Node and Cloudflare targets. */
 
+import * as v from 'valibot';
 import type { FlueContextInternal } from '../client.ts';
 import {
 	InvalidRequestError,
@@ -20,6 +21,7 @@ import { agentStreamPath, parseOffset, runStreamPath, type EventStreamStore } fr
 import { generateWorkflowRunId } from './ids.ts';
 import type { RunOwner, RunRegistry } from './run-registry.ts';
 import { isEphemeralRunEvent, type RunStore } from './run-store.ts';
+import { DirectAgentPayloadSchema } from './schemas.ts';
 
 
 export type WorkflowHandler = (ctx: FlueContextInternal) => unknown | Promise<unknown>;
@@ -48,15 +50,14 @@ function isDispatchInput(value: unknown): value is DispatchInput {
 }
 
 function parseDirectAgentPayload(payload: unknown): DirectAgentPayload {
-	const expected = 'Direct agent requests must use JSON object body { "message": string }.';
-	if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-		throw new InvalidRequestError({ reason: expected });
-	}
-	const value = payload as { message?: unknown };
-	if (typeof value.message !== 'string') {
-		throw new InvalidRequestError({ reason: expected });
-	}
-	return { message: value.message };
+	const parsed = v.safeParse(DirectAgentPayloadSchema, payload);
+	if (parsed.success) return parsed.output;
+	const oversizedImageIssue = parsed.issues.find((issue) => issue.type === 'max_length');
+	throw new InvalidRequestError({
+		reason:
+			oversizedImageIssue?.message ??
+			'Direct agent requests must use JSON object body { "message": string, "images"?: image[] }.',
+	});
 }
 
 /**

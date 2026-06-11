@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### New Features
+
+- Direct agent HTTP requests and `@flue/sdk` prompts can include images with up to 14 MiB of encoded data per image. Node and Cloudflare SQLite persistence stores image data in safe chunks and restores it for future turns and after restarts.
+
 ### Fixes & Other Changes
 
 - SQL-backed sessions now store each history entry in its own row instead of rewriting the entire session history as one JSON value. Session saves remain transactional and preserve ordered history across Cloudflare Durable Object SQLite, Node SQLite, and PostgreSQL.

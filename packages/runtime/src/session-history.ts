@@ -11,6 +11,7 @@ import type {
 	SessionData,
 	SessionEntry,
 	SignalMessage,
+	PromptImage,
 } from './types.ts';
 
 export type MessageSource = MessageEntry['source'];
@@ -362,10 +363,10 @@ function createContextSummaryMessage(summary: string, timestamp: string): AgentM
 	return createUserContextMessage(renderSignalMessage(signal), timestamp);
 }
 
-export function createUserContextMessage(text: string, timestamp: string): AgentMessage {
+export function createUserContextMessage(text: string, timestamp: string, images: PromptImage[] = []): AgentMessage {
 	return {
 		role: 'user',
-		content: [{ type: 'text', text }],
+		content: [{ type: 'text', text }, ...images],
 		timestamp: new Date(timestamp).getTime(),
 	} as UserMessage as AgentMessage;
 }
