@@ -88,10 +88,13 @@ export const docsSections: DocsSection[] = [
 				items: [{ title: 'React', slug: 'guide/react' }],
 			},
 			{
-				title: 'Deploy',
+				title: 'Build & Deploy',
 				items: [
-					{ title: 'Node.js', slug: 'guide/targets/node' },
 					{ title: 'Cloudflare', slug: 'guide/targets/cloudflare' },
+					{ title: 'Node.js', slug: 'guide/targets/node' },
+					{ title: 'GitHub Actions', slug: 'ecosystem/deploy/github-actions' },
+					{ title: 'GitLab CI/CD', slug: 'ecosystem/deploy/gitlab-ci' },
+					{ title: 'Render', slug: 'ecosystem/deploy/render' },
 				],
 			},
 		],
@@ -223,16 +226,6 @@ export const docsSections: DocsSection[] = [
 			{
 				title: 'Ecosystem',
 				items: [{ title: 'Overview', slug: 'ecosystem/overview' }],
-			},
-			{
-				title: 'Deployment',
-				items: [
-					{ title: 'Cloudflare', slug: 'ecosystem/deploy/cloudflare' },
-					{ title: 'GitHub Actions', slug: 'ecosystem/deploy/github-actions' },
-					{ title: 'GitLab CI/CD', slug: 'ecosystem/deploy/gitlab-ci' },
-					{ title: 'Node.js', slug: 'ecosystem/deploy/node' },
-					{ title: 'Render', slug: 'ecosystem/deploy/render' },
-				],
 			},
 			{
 				title: 'Sandboxes',
